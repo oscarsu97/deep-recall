@@ -256,8 +256,22 @@ requests never receive them, and `workflow_dispatch` requires write access. The
 one rule is to read any PR that touches `.github/workflows/` before merging it.
 
 The workflow runs once daily at **13:00 UTC = 21:00 Asia/Singapore**: sync →
-notify → serve buttons for 50 minutes → push. Trigger it by hand from the
-Actions tab to test.
+notify → serve buttons for 4 hours → push. Trigger it by hand from the Actions
+tab to test.
+
+**When can you answer?** Cards land ~2 minutes after the run starts, and the
+buttons stay live for `poll_minutes` (default 240), so roughly **21:03 → 01:03
+SGT**. Miss it and nothing is lost — unrated cards stay due and are re-sent the
+next day — but the buttons on the old message go dead, because a callback needs
+a live poller to receive it. To rate outside the window, run `--bot-poll`
+locally, or use the CLI:
+
+```bash
+python -m src.main --review <card-id> --quality good
+```
+
+`poll_minutes` can go up to ~330; GitHub caps a single job at 6 hours. Raise
+`timeout-minutes` to match if you change it.
 
 To move it, edit the one `cron` line in `daily_sync.yml` — **GitHub crons are
 always UTC and never observe DST**, so subtract your offset yourself:

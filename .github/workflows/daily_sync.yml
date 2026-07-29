@@ -20,7 +20,7 @@ on:
       poll_minutes:
         description: "Minutes to serve the inline buttons"
         type: string
-        default: "50"
+        default: "240"
 
 concurrency:
   group: deeprecall-daily
@@ -32,8 +32,9 @@ permissions:
 jobs:
   sync-and-review:
     runs-on: ubuntu-latest
-    # Hard ceiling so a hung API call cannot burn the monthly minute budget.
-    timeout-minutes: 70
+    # Must exceed poll_minutes plus setup. GitHub caps a single job at 6h
+    # (360 min), so poll_minutes can go to ~330 but no further.
+    timeout-minutes: 260
 
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -103,7 +104,7 @@ jobs:
         # only costs the ratings not yet given — nothing already saved is lost.
         continue-on-error: true
         run: |
-          MINUTES="${{ inputs.poll_minutes || '50' }}"
+          MINUTES="${{ inputs.poll_minutes || '240' }}"
           python -m src.main --bot-poll --duration $(( MINUTES * 60 ))
 
       # Runs inside vault/ so git resolves the vault repo under the split
