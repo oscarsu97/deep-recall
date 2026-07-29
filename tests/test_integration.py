@@ -23,7 +23,10 @@ from src.vault import Vault
 from tests.test_ingestion import FakeNotion, PAGE, block
 from tests.test_synthesizer import GOOD_CARD, FakeProvider
 
-TODAY = date(2026, 7, 29)
+#: Must track the wall clock: `render_card` stamps new cards with the real
+#: `date.today()`, so pinning this to a literal makes the test fail whenever
+#: the date rolls past it.
+TODAY = date.today()
 
 NOTION_BLOCKS = {
     "page-1": [

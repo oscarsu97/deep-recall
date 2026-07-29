@@ -214,6 +214,91 @@ def test_the_first_draft_is_kept_when_the_rewrite_is_no_better(note, monkeypatch
     assert "Nope." not in card.direct_mechanism
 
 
+GEMINI_DAILY_429 = (
+    "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current "
+    "quota', 'status': 'RESOURCE_EXHAUSTED', 'details': [{'@type': 'type.googleapis.com/"
+    "google.rpc.QuotaFailure', 'violations': [{'quotaMetric': 'generativelanguage.googleapis"
+    ".com/generate_content_free_tier_requests', 'quotaId': 'GenerateRequestsPerDayPerProject"
+    "PerModel-FreeTier', 'quotaValue': '20'}]}, {'@type': 'type.googleapis.com/google.rpc."
+    "RetryInfo', 'retryDelay': '43s'}]}}"
+)
+
+GEMINI_PER_MINUTE_429 = (
+    "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'quotaId': "
+    "'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', 'retryDelay': '7s'}}"
+)
+
+
+def test_a_daily_quota_error_is_recognised():
+    from src.synthesizer import is_daily_quota_error
+
+    assert is_daily_quota_error(GEMINI_DAILY_429)
+
+
+def test_a_per_minute_limit_is_not_treated_as_a_daily_quota():
+    from src.synthesizer import is_daily_quota_error
+
+    assert not is_daily_quota_error(GEMINI_PER_MINUTE_429)
+
+
+def test_groq_daily_phrasing_is_recognised():
+    from src.synthesizer import is_daily_quota_error
+
+    assert is_daily_quota_error(
+        "429 rate_limit_exceeded: Limit 1000 requests per day reached for model X"
+    )
+
+
+def test_the_providers_retry_hint_is_honoured():
+    from src.synthesizer import retry_after_seconds
+
+    assert retry_after_seconds(GEMINI_PER_MINUTE_429, default=2.0) == 8.0
+    assert retry_after_seconds("no hint here", default=2.0) == 2.0
+
+
+def test_a_daily_quota_aborts_immediately_without_retrying(note, monkeypatch):
+    """161 doomed calls is what this prevents."""
+    from src.synthesizer import QuotaExhaustedError
+
+    monkeypatch.setattr("src.synthesizer.MIN_SECONDS_BETWEEN_CALLS", 0)
+    monkeypatch.setattr("src.synthesizer.BASE_BACKOFF_SECONDS", 0)
+
+    calls = []
+
+    class Exhausted:
+        name = "gemini"
+
+        def generate(self, system, messages):
+            calls.append(1)
+            raise RuntimeError(GEMINI_DAILY_429)
+
+    with pytest.raises(QuotaExhaustedError):
+        Synthesizer(Config(), provider=Exhausted()).synthesize(note)
+
+    assert len(calls) == 1, "a daily quota must not be retried"
+
+
+def test_a_per_minute_limit_is_still_retried(note, monkeypatch):
+    monkeypatch.setattr("src.synthesizer.MIN_SECONDS_BETWEEN_CALLS", 0)
+    monkeypatch.setattr("src.synthesizer.BASE_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr("src.synthesizer.retry_after_seconds", lambda text, default: 0)
+
+    calls = []
+
+    class Flaky:
+        name = "gemini"
+
+        def generate(self, system, messages):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError(GEMINI_PER_MINUTE_429)
+            return json.dumps(GOOD_CARD)
+
+    card = Synthesizer(Config(), provider=Flaky()).synthesize(note)
+    assert len(calls) == 2
+    assert card.id == "kafka-retry-patterns"
+
+
 def test_provider_failure_surfaces_as_synthesis_error(note, monkeypatch):
     monkeypatch.setattr("src.synthesizer.MIN_SECONDS_BETWEEN_CALLS", 0)
     monkeypatch.setattr("src.synthesizer.BASE_BACKOFF_SECONDS", 0)

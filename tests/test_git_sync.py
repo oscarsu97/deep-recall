@@ -167,6 +167,35 @@ def test_push_failure_still_leaves_the_commit_intact(tmp_path, caplog):
     assert any("push failed" in r.message for r in caplog.records)
 
 
+def test_one_missing_path_does_not_lose_the_whole_commit(tmp_path, caplog):
+    """`git add` aborts on a bad pathspec and stages nothing — the real failure
+    mode that left a whole sync uncommitted."""
+    repo = make_repo(tmp_path / "repo")
+    vault = Vault(repo / "vault")
+    vault.ensure()
+    good_a = write_card(vault, "card-a")
+    good_b = write_card(vault, "card-b")
+    vanished = vault.root / "distributed-systems" / "never-written.md"
+
+    assert git_sync.commit_paths(
+        [good_a, vanished, good_b], "sync: add 3 card(s)", repo=vault.root, push=False
+    ) is True
+
+    committed = git("show", "--name-only", "--format=", cwd=repo).stdout
+    assert "card-a.md" in committed
+    assert "card-b.md" in committed, "a missing sibling must not drop the good cards"
+    assert any("not on disk" in r.message for r in caplog.records)
+
+
+def test_commit_fails_cleanly_when_no_path_exists(tmp_path):
+    repo = make_repo(tmp_path / "repo")
+    vault = Vault(repo / "vault")
+    vault.ensure()
+    assert git_sync.commit_paths(
+        [vault.root / "gone.md"], "nothing", repo=vault.root, push=False
+    ) is False
+
+
 def test_empty_path_list_is_ignored(tmp_path):
     repo = make_repo(tmp_path / "repo")
     assert git_sync.commit_paths([], "nothing", repo=repo, push=False) is False

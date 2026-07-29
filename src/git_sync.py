@@ -63,7 +63,18 @@ def commit_paths(paths: list[Path], message: str, repo: Path, push: bool = True)
 
     _ensure_identity(repo)
 
-    add = _run(["git", "add", "--", *[str(p) for p in paths]], repo)
+    # `git add` is all-or-nothing: one missing pathspec aborts the whole
+    # command and stages nothing, so a single vanished file would silently
+    # leave an entire sync uncommitted. Drop missing paths first.
+    present = [p for p in paths if p.exists()]
+    for missing in [p for p in paths if not p.exists()]:
+        log.warning("Expected to commit %s but it is not on disk; skipping it.", missing)
+
+    if not present:
+        log.error("None of the %d path(s) to commit exist on disk.", len(paths))
+        return False
+
+    add = _run(["git", "add", "--", *[str(p) for p in present]], repo)
     if add.returncode != 0:
         log.error("git add failed: %s", add.stderr.strip())
         return False

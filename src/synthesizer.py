@@ -49,6 +49,45 @@ class SynthesisError(RuntimeError):
     """Raised when the LLM cannot be reached or returns unusable output."""
 
 
+class QuotaExhaustedError(SynthesisError):
+    """The provider's *daily* quota is spent.
+
+    Distinct from a per-minute rate limit because no amount of backoff inside
+    this run will clear it — the batch must stop rather than burn one doomed
+    call per remaining note.
+    """
+
+
+_RETRY_DELAY = re.compile(r"retryDelay['\"]?:\s*['\"]?(\d+(?:\.\d+)?)s", re.IGNORECASE)
+
+
+def _is_quota_error(text: str) -> bool:
+    lowered = text.lower()
+    return "resource_exhausted" in lowered or "429" in lowered or "rate_limit" in lowered
+
+
+def is_daily_quota_error(text: str) -> bool:
+    """True for a per-day cap, false for a per-minute one.
+
+    Google encodes the window in the quota id
+    (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`); Groq spells it out
+    in prose. Both are matched here.
+    """
+    if not _is_quota_error(text):
+        return False
+    squashed = text.lower().replace("_", "").replace("-", "").replace(" ", "")
+    return "perday" in squashed or "requestsperday" in squashed or "rpd" in squashed
+
+
+def retry_after_seconds(text: str, default: float) -> float:
+    """Honour the provider's own retry hint when it gives one."""
+    match = _RETRY_DELAY.search(text)
+    if not match:
+        return default
+    # Cap it: a hint longer than a minute means we should not be looping here.
+    return min(float(match.group(1)) + 1.0, 65.0)
+
+
 # ---------------------------------------------------------------------------
 # Prompt
 # ---------------------------------------------------------------------------
@@ -463,14 +502,26 @@ class Synthesizer:
                 return self.provider.generate(SYSTEM_PROMPT, messages)
             except Exception as exc:  # noqa: BLE001 - provider SDKs raise freely
                 last_exc = exc
-                text = str(exc).lower()
-                fatal = any(k in text for k in ("api key", "unauthorized", "permission denied", "401", "403"))
+                text = str(exc)
+                lowered = text.lower()
+
+                # A daily cap cannot be waited out inside this run. Fail loudly
+                # and immediately so the caller can stop the whole batch.
+                if is_daily_quota_error(text):
+                    raise QuotaExhaustedError(
+                        f"{self.provider.name} daily free-tier quota exhausted. "
+                        f"Remaining notes will be picked up by the next run, or switch "
+                        f"LLM_PROVIDER (you have both Gemini and Groq configured)."
+                    ) from exc
+
+                fatal = any(k in lowered for k in ("api key", "unauthorized", "permission denied", "401", "403"))
                 if fatal or attempt == MAX_LLM_RETRIES - 1:
                     break
-                delay = BASE_BACKOFF_SECONDS * (2**attempt)
+
+                delay = retry_after_seconds(text, BASE_BACKOFF_SECONDS * (2**attempt))
                 log.warning(
                     "%s call failed (%s); retrying in %.1fs [%d/%d]",
-                    self.provider.name, exc, delay, attempt + 1, MAX_LLM_RETRIES,
+                    self.provider.name, str(exc)[:160], delay, attempt + 1, MAX_LLM_RETRIES,
                 )
                 time.sleep(delay)
         raise SynthesisError(f"{self.provider.name} synthesis failed: {last_exc}") from last_exc

@@ -123,7 +123,7 @@ def _plan_sync(
 def cmd_sync(config: Config, args: argparse.Namespace) -> int:
     """Ingest recent Notion notes and synthesise them into vault cards."""
     from .ingestion import IngestionError, NotionIngestor
-    from .synthesizer import SynthesisError, Synthesizer
+    from .synthesizer import QuotaExhaustedError, SynthesisError, Synthesizer
 
     config.require_notion()
     if not args.dry_run:
@@ -173,12 +173,24 @@ def cmd_sync(config: Config, args: argparse.Namespace) -> int:
     synthesizer = Synthesizer(config)
     written: list[Path] = []
     failures = 0
+    quota_hit = False
 
     for i, (note, existing) in enumerate(pending, 1):
         verb = "synthesising" if existing is None else "regenerating"
         log.info("[%d/%d] %s: %s", i, len(pending), verb, note.question[:70])
         try:
             card = synthesizer.synthesize(note)
+        except QuotaExhaustedError as exc:
+            # Every remaining note would fail identically; stop rather than
+            # spend the next ten minutes proving it.
+            log.error("  ✗ %s", exc)
+            log.error(
+                "Stopped after %d card(s). %d note(s) left — they stay in Notion "
+                "and will be picked up by the next sync.",
+                len(written), len(pending) - i + 1,
+            )
+            quota_hit = True
+            break
         except SynthesisError as exc:
             # One bad note must not abandon the rest of the batch.
             log.error("  ✗ %s", exc)
@@ -209,7 +221,8 @@ def cmd_sync(config: Config, args: argparse.Namespace) -> int:
             push=not args.no_push,
         )
 
-    log.info("Sync complete: %d card(s) written, %d failure(s)", len(written), failures)
+    log.info("Sync complete: %d card(s) written, %d failure(s)%s",
+             len(written), failures, " (stopped early: quota)" if quota_hit else "")
     # Partial success is still success; only a total wipe-out is an error.
     return 1 if failures and not written else 0
 

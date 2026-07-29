@@ -200,10 +200,22 @@ Everything nested underneath (to any depth) becomes the raw answer. Notes under
 
 ### 3. LLM provider
 
-| Provider   | Free tier                       | Get a key                                    |
-| ---------- | ------------------------------- | -------------------------------------------- |
-| **Gemini** | ~15 req/min, 1500 req/day       | <https://aistudio.google.com/apikey>         |
-| **Groq**   | ~30 req/min, generous daily cap | <https://console.groq.com/keys>              |
+| Provider   | Free tier                            | Get a key                            |
+| ---------- | ------------------------------------ | ------------------------------------ |
+| **Gemini** | **varies hugely by model** (see below) | <https://aistudio.google.com/apikey> |
+| **Groq**   | ~30 req/min, ~1000 req/day           | <https://console.groq.com/keys>      |
+
+> ⚠️ **Check the daily cap for your specific Gemini model before a big sync.**
+> The free-tier request-per-day limit is per model and differs by orders of
+> magnitude — some newer Flash models allow only **20 requests/day**, while
+> older ones allow four figures. A 60-note backfill will die almost immediately
+> on a 20/day model. Current limits:
+> <https://ai.google.dev/gemini-api/docs/rate-limits>
+>
+> DeepRecall detects a *daily* quota error and stops the batch immediately
+> rather than issuing one doomed request per remaining note; unsynced notes are
+> simply picked up by the next run. Per-minute limits are still retried, using
+> the provider's own `retryDelay` hint.
 
 Set `LLM_PROVIDER=gemini` (default) or `groq`. Requests are throttled to one
 every 4 seconds to stay inside the free rate limits. `GEMINI_MODEL` defaults to
@@ -415,7 +427,7 @@ each choice would produce for that specific card (`🟡 Good (14d)`), computed v
 | Component      | Free tier                                            |
 | -------------- | ---------------------------------------------------- |
 | Notion API     | unlimited for internal integrations                  |
-| Gemini / Groq  | ~1500 / ~14 400 requests per day                     |
+| Gemini / Groq  | model-dependent (20–1500/day) / ~1000 per day        |
 | Telegram Bot   | unlimited                                            |
 | GitHub Actions | unlimited on public repos, 2000 min/mo on private    |
 | Storage        | Markdown in git                                      |
