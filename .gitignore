@@ -1,0 +1,23 @@
+.env
+
+# Virtualenvs — any name. A committed venv is ~200MB of platform-specific
+# binaries, and this repo is public.
+.venv/
+venv/
+myenv/
+env/
+*/pyvenv.cfg
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# Local run state (offsets, caches) — not worth versioning.
+.deeprecall/
+
+# Your flashcards live in a separate PRIVATE repo, checked out here.
+# This line is what keeps personal notes out of a public code repo.
+# Using the single-repo layout instead? Delete it so the vault is versioned.
+/vault/

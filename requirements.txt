@@ -1,0 +1,16 @@
+# --- Core ---------------------------------------------------------------
+python-dotenv>=1.0.1
+PyYAML>=6.0.1
+httpx>=0.27.0
+
+# --- Notion ingestion ---------------------------------------------------
+notion-client>=2.2.1
+
+# --- LLM synthesis ------------------------------------------------------
+# Gemini free tier -> https://aistudio.google.com/apikey
+google-genai>=1.0.0
+# Groq free tier   -> https://console.groq.com/keys (called over plain HTTP, no SDK needed)
+
+# --- Telegram bot -------------------------------------------------------
+# The [job-queue] extra powers the bounded `--bot-poll --duration` session.
+python-telegram-bot[job-queue]>=21.6

@@ -1,0 +1,120 @@
+name: DeepRecall Daily Sync
+
+# Minutes are billed to the repository that RUNS the workflow, not the ones it
+# touches. So keeping this repo public buys unlimited free minutes even while
+# the job commits flashcards to a private vault repo — see VAULT_REPO below.
+# (Private repos get 2,000 min/month; the default ~55 min/day would not fit.)
+on:
+  schedule:
+    # 13:00 UTC = 21:00 Asia/Singapore (UTC+8, no DST) — end of day.
+    # Running last thing means the 24h lookback captures notes written *today*.
+    # GitHub queues cron runs under load, so treat this as "some time after
+    # 21:00", not an exact alarm.
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      skip_sync:
+        description: "Skip Notion ingestion (just push due cards)"
+        type: boolean
+        default: false
+      poll_minutes:
+        description: "Minutes to serve the inline buttons"
+        type: string
+        default: "50"
+
+concurrency:
+  group: deeprecall-daily
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-review:
+    runs-on: ubuntu-latest
+    # Hard ceiling so a hung API call cannot burn the monthly minute budget.
+    timeout-minutes: 70
+
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'gemini' }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      INGEST_LOOKBACK_HOURS: "24"
+      GIT_AUTO_COMMIT: "true"
+      PYTHONUNBUFFERED: "1"
+      VAULT_DIR: vault
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          # Needed so the bot can rebase onto anything pushed mid-session.
+          fetch-depth: 0
+
+      # Split layout: flashcards live in a separate PRIVATE repo, so this repo
+      # can stay public. Set the `VAULT_REPO` variable (e.g. "you/deep-recall-vault")
+      # and a `VAULT_TOKEN` secret. Leave VAULT_REPO unset to keep the vault in
+      # this repo instead.
+      - name: Check out private vault
+        if: ${{ vars.VAULT_REPO != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.VAULT_REPO }}
+          token: ${{ secrets.VAULT_TOKEN }}
+          path: vault
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Applied inside the vault, which is the repo that actually receives
+      # commits under either layout.
+      - name: Configure git identity
+        run: |
+          mkdir -p vault
+          git -C vault config user.name  "DeepRecall Bot"
+          git -C vault config user.email "deeprecall@users.noreply.github.com"
+
+      # Ingestion is allowed to fail (expired Notion token, LLM quota) without
+      # cancelling the review session — yesterday's cards are still due today.
+      - name: Sync Notion → vault
+        if: ${{ inputs.skip_sync != true }}
+        continue-on-error: true
+        run: python -m src.main --sync --verbose
+
+      - name: Push today's due cards
+        run: python -m src.main --notify
+
+      - name: Serve inline buttons
+        # Ratings are committed by the bot as they arrive, so an early exit
+        # only costs the ratings not yet given — nothing already saved is lost.
+        continue-on-error: true
+        run: |
+          MINUTES="${{ inputs.poll_minutes || '50' }}"
+          python -m src.main --bot-poll --duration $(( MINUTES * 60 ))
+
+      # Runs inside vault/ so git resolves the vault repo under the split
+      # layout, and the enclosing repo under the single-repo layout.
+      - name: Push any straggler commits
+        if: always()
+        working-directory: vault
+        run: |
+          git pull --rebase --autostash || true
+          git push || echo "Nothing to push."
+
+      - name: Vault summary
+        if: always()
+        run: python -m src.main --stats
