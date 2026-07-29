@@ -413,10 +413,19 @@ def render_card(data: dict[str, Any], note: RawNote | None = None, today: date |
         # Lets `--sync` recognise this note next run even though the LLM
         # rewrote the question (and therefore the id).
         meta["source_note_id"] = note.suggested_id
+        # The Notion block id survives a reworded question; the content hash is
+        # what tells a later sync that the note's body changed.
+        if note.block_id:
+            meta["source_block_id"] = note.block_id
+        meta["source_hash"] = note.content_hash
         if note.source_url:
             meta["source_url"] = note.source_url
 
-    return Card(id=card_id, topic=topic, question=question, sections=sections, meta=meta)
+    card = Card(id=card_id, topic=topic, question=question, sections=sections, meta=meta)
+    # Written only here, never by `save()`, so that rating a card does not reset
+    # it — that is what makes hand-edit detection reliable.
+    card.meta["body_hash"] = card.body_digest()
+    return card
 
 
 def _as_if(condition: str) -> str:

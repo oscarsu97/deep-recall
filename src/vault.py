@@ -12,6 +12,7 @@ in Obsidian are never silently destroyed by the bot writing back a rating.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -51,8 +52,23 @@ FRONTMATTER_ORDER = (
     "interval",
     "ease_factor",
     "repetition_count",
+    "source_block_id",
     "source_note_id",
+    "source_hash",
+    "body_hash",
     "source_url",
+    "last_reviewed",
+    "revised",
+)
+
+#: Frontmatter carried across a regeneration — review history must survive an
+#: edit to the source note, or every Notion tweak would reset the schedule.
+REVIEW_STATE_KEYS = (
+    "created",
+    "interval",
+    "ease_factor",
+    "repetition_count",
+    "next_review",
     "last_reviewed",
 )
 
@@ -77,6 +93,16 @@ def slugify(value: str, max_length: int = 60) -> str:
     if len(slug) > max_length:
         slug = slug[:max_length].rstrip("-")
     return slug or "untitled"
+
+
+def content_digest(text: str) -> str:
+    """Short stable digest of some text.
+
+    Trailing whitespace and blank-line churn are normalised away so that
+    cosmetic edits in Notion or Obsidian don't read as content changes.
+    """
+    normalised = "\n".join(line.rstrip() for line in (text or "").strip().splitlines())
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
 
 
 def _parse_date(value: Any) -> date | None:
@@ -131,6 +157,44 @@ class Card:
 
     def is_due(self, today: date | None = None) -> bool:
         return is_due(self.review_state.next_review, today)
+
+    # -- provenance -------------------------------------------------------
+
+    def body_digest(self) -> str:
+        """Digest of the question and sections — everything a human edits."""
+        parts = [self.question.strip()]
+        for title in sorted(self.sections):
+            parts.append(f"## {title}\n{self.sections[title].strip()}")
+        return content_digest("\n\n".join(parts))
+
+    def is_hand_edited(self) -> bool:
+        """True if the body changed since DeepRecall last generated it.
+
+        `body_hash` is written only by the synthesizer, never by `save()`, so
+        rating a card does not reset it. A mismatch therefore means you edited
+        the card in Obsidian — and regenerating would destroy that work.
+        """
+        stored = self.meta.get("body_hash")
+        return bool(stored) and str(stored) != self.body_digest()
+
+    def carry_review_state_from(self, previous: "Card") -> None:
+        """Adopt a previous card's identity and SM-2 history.
+
+        Used when a source note changed and the card was regenerated: the
+        content is new, but it is the *same* card as far as scheduling and the
+        vault filename are concerned.
+        """
+        self.id = previous.id
+        self.meta["id"] = previous.id
+        # Keep the original topic so the file does not move to a new folder and
+        # leave a duplicate behind.
+        self.topic = previous.topic
+        self.meta["topic"] = previous.topic
+        self.path = previous.path
+
+        for key in REVIEW_STATE_KEYS:
+            if key in previous.meta:
+                self.meta[key] = previous.meta[key]
 
     # -- Content accessors used by the Telegram flow ----------------------
 
@@ -401,13 +465,25 @@ class Vault:
         `source_note_id`, and `--sync` checks both — otherwise every daily run
         would re-synthesise the same notes under slightly different ids.
         """
-        ids: set[str] = set()
+        return set(self.index_by_source())
+
+    def index_by_source(self) -> dict[str, Card]:
+        """Map every identifier a note could match on to its existing card.
+
+        Keys are the Notion block id (stable when you reword a question), the
+        slug of the original question (legacy cards predating block ids), and
+        the card's own id.
+        """
+        index: dict[str, Card] = {}
         for card in self.load_all():
-            ids.add(card.id)
-            source = card.meta.get("source_note_id")
-            if source:
-                ids.add(str(source))
-        return ids
+            for key in (
+                card.meta.get("source_block_id"),
+                card.meta.get("source_note_id"),
+                card.id,
+            ):
+                if key:
+                    index.setdefault(str(key), card)
+        return index
 
     def due_cards(self, today: date | None = None, limit: int | None = None) -> list[Card]:
         """Cards with `next_review <= today`, most overdue first."""

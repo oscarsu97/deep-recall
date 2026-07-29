@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, TypeVar
 
 from .config import Config
-from .vault import slugify
+from .vault import content_digest, slugify
 
 log = logging.getLogger(__name__)
 
@@ -66,10 +66,18 @@ class RawNote:
     page_id: str = ""
     source_url: str = ""
     breadcrumbs: list[str] = field(default_factory=list)
+    #: Notion block id of the question. Stable when you reword the question,
+    #: which is what stops an edited title creating a duplicate card.
+    block_id: str = ""
 
     @property
     def suggested_id(self) -> str:
         return slugify(self.question, max_length=48)
+
+    @property
+    def content_hash(self) -> str:
+        """Digest of the answer text — changes when you edit the note."""
+        return content_digest(self.raw_answer)
 
     @property
     def suggested_topic(self) -> str:
@@ -285,7 +293,7 @@ class NotionIngestor:
         title = _page_title(page)
         url = page.get("url", "")
 
-        def emit(question: str, answer: str, trail: list[str]) -> None:
+        def emit(question: str, answer: str, trail: list[str], block_id: str = "") -> None:
             note = RawNote(
                 question=question.strip(),
                 raw_answer=answer.strip(),
@@ -293,6 +301,7 @@ class NotionIngestor:
                 page_id=page.get("id", ""),
                 source_url=url,
                 breadcrumbs=list(trail),
+                block_id=block_id,
             )
             if note.is_substantive():
                 notes.append(note)
@@ -324,7 +333,7 @@ class NotionIngestor:
                 if nested:
                     notes.extend(nested)
                 else:
-                    emit(text, self._flatten(scoped), breadcrumbs + [text])
+                    emit(text, self._flatten(scoped), breadcrumbs + [text], block["id"])
                 index = end
                 continue
 
@@ -335,12 +344,12 @@ class NotionIngestor:
                 if nested and not _looks_like_question(text):
                     notes.extend(nested)
                 else:
-                    emit(text, self._flatten(children), breadcrumbs)
+                    emit(text, self._flatten(children), breadcrumbs, block["id"])
                 index += 1
                 continue
 
             if btype == "bulleted_list_item" and _looks_like_question(text) and block.get("has_children"):
-                emit(text, self._flatten(self._children(block["id"])), breadcrumbs)
+                emit(text, self._flatten(self._children(block["id"])), breadcrumbs, block["id"])
                 index += 1
                 continue
 

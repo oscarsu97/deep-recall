@@ -357,9 +357,32 @@ Parsing is **structure-preserving**: frontmatter keys you add and `##` sections
 you write yourself in Obsidian survive the bot rewriting the schedule. Writes
 are atomic (`os.replace`), so an interrupted run can't truncate a card.
 
-`source_note_id` is what makes re-syncing idempotent — the LLM rewrites the
-question (and therefore the card id), so without it every daily run would
-regenerate the same notes under slightly different slugs.
+### How edits are handled
+
+Four frontmatter keys make re-syncing idempotent *and* edit-aware:
+
+| Key | Purpose |
+| --- | ------- |
+| `source_note_id` | Slug of the original Notion question. The LLM rewrites the question, so without this every run would regenerate the same note under a new slug |
+| `source_block_id` | Notion block id — **stable when you reword a question**, so a retitled note updates its card instead of creating a duplicate |
+| `source_hash` | Digest of the raw Notion answer. Differs on the next sync ⇒ the note was edited ⇒ regenerate |
+| `body_hash` | Digest of the card body as generated. Differs ⇒ *you* edited the card in Obsidian |
+
+The resulting decision table for each ingested note:
+
+```
+no matching card              -> synthesise a new one
+hash matches                  -> skip, no LLM call
+hash differs                  -> regenerate, keeping id, file path and SM-2 history
+hash differs + hand-edited    -> skip, and warn (--force overrides)
+card has no source_hash yet   -> backfill provenance, do not regenerate
+```
+
+Regeneration deliberately preserves `interval`, `ease_factor`,
+`repetition_count` and `next_review`: editing a note should sharpen the card,
+not reset months of review history. `body_hash` is written only by the
+synthesizer and never by `save()`, so rating a card cannot be mistaken for a
+hand edit.
 
 ---
 

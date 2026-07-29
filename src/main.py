@@ -55,6 +55,71 @@ def setup_logging(verbose: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _plan_sync(
+    vault: Vault, notes: list, force: bool = False, backfill: bool = True
+) -> tuple[list[tuple], int]:
+    """Decide, per ingested note, whether to create, regenerate, or skip.
+
+    Returns `(pending, backfilled)` where `pending` is a list of
+    `(note, existing_card_or_None)` and `backfilled` counts pre-existing cards
+    that gained provenance metadata without needing an LLM call.
+
+    A note is matched to an existing card by Notion block id first (stable when
+    you reword the question) and by question slug second (cards created before
+    block ids were recorded).
+    """
+    if force:
+        return [(note, None) for note in notes], 0
+
+    index = vault.index_by_source()
+    pending: list[tuple] = []
+    backfilled = 0
+
+    for note in notes:
+        existing = index.get(note.block_id) if note.block_id else None
+        existing = existing or index.get(note.suggested_id)
+
+        if existing is None:
+            pending.append((note, None))
+            continue
+
+        stored_hash = existing.meta.get("source_hash")
+        if not stored_hash:
+            # Card predates content hashing. We cannot tell whether the note
+            # changed, so assume not — regenerating everything on upgrade would
+            # be a nasty surprise — but record the hash so edits are caught from
+            # now on.
+            if not backfill:
+                log.debug("• would backfill provenance: %s", existing.id)
+                continue
+            existing.meta["source_hash"] = note.content_hash
+            if note.block_id:
+                existing.meta.setdefault("source_block_id", note.block_id)
+            existing.meta.setdefault("body_hash", existing.body_digest())
+            try:
+                vault.save(existing)
+                backfilled += 1
+            except VaultError as exc:
+                log.warning("Could not backfill provenance for %s: %s", existing.id, exc)
+            continue
+
+        if str(stored_hash) == note.content_hash:
+            log.debug("• unchanged: %s", existing.id)
+            continue
+
+        if existing.is_hand_edited():
+            log.warning(
+                "• %s changed in Notion, but the card was edited in Obsidian — "
+                "skipping to protect your edits (use --force to overwrite).",
+                existing.id,
+            )
+            continue
+
+        pending.append((note, existing))
+
+    return pending, backfilled
+
+
 def cmd_sync(config: Config, args: argparse.Namespace) -> int:
     """Ingest recent Notion notes and synthesise them into vault cards."""
     from .ingestion import IngestionError, NotionIngestor
@@ -78,22 +143,26 @@ def cmd_sync(config: Config, args: argparse.Namespace) -> int:
         log.info("No new Q&A notes found. Nothing to synthesise.")
         return 0
 
-    known = set() if args.force else vault.known_ids()
-    pending = []
-    for note in notes:
-        if note.suggested_id in known:
-            log.info("• skip (already in vault): %s", note.question[:70])
-            continue
-        pending.append(note)
+    pending, backfilled = _plan_sync(
+        vault, notes, force=args.force, backfill=not args.dry_run
+    )
+
+    if backfilled and not args.dry_run:
+        log.info("Backfilled provenance on %d pre-existing card(s)", backfilled)
 
     if args.limit:
         pending = pending[: args.limit]
 
-    log.info("%d note(s) to synthesise (%d ingested)", len(pending), len(notes))
+    new_count = sum(1 for _, existing in pending if existing is None)
+    log.info(
+        "%d note(s) to synthesise — %d new, %d changed (%d ingested)",
+        len(pending), new_count, len(pending) - new_count, len(notes),
+    )
 
     if args.dry_run:
-        for note in pending:
-            print(f"\n--- {note.suggested_id} [{note.suggested_topic}]")
+        for note, existing in pending:
+            marker = "NEW" if existing is None else f"CHANGED -> {existing.id}"
+            print(f"\n--- {note.suggested_id} [{note.suggested_topic}]  ({marker})")
             print(f"Q: {note.question}")
             print(note.raw_answer[:500])
         return 0
@@ -105,8 +174,9 @@ def cmd_sync(config: Config, args: argparse.Namespace) -> int:
     written: list[Path] = []
     failures = 0
 
-    for i, note in enumerate(pending, 1):
-        log.info("[%d/%d] synthesising: %s", i, len(pending), note.question[:70])
+    for i, (note, existing) in enumerate(pending, 1):
+        verb = "synthesising" if existing is None else "regenerating"
+        log.info("[%d/%d] %s: %s", i, len(pending), verb, note.question[:70])
         try:
             card = synthesizer.synthesize(note)
         except SynthesisError as exc:
@@ -114,6 +184,12 @@ def cmd_sync(config: Config, args: argparse.Namespace) -> int:
             log.error("  ✗ %s", exc)
             failures += 1
             continue
+
+        if existing is not None:
+            # Same card, new content: keep its id, file location and schedule.
+            card.carry_review_state_from(existing)
+            card.meta["revised"] = date.today().isoformat()
+
         try:
             path = vault.save(card)
         except VaultError as exc:
