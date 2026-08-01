@@ -258,10 +258,19 @@ On the **code** repo, under **Settings → Secrets and variables → Actions**:
 | -------------------- | --------------------------------------------- |
 | `VAULT_REPO`         | split layout — e.g. `you/deep-recall-vault`   |
 | `LLM_PROVIDER`       | optional, defaults to `gemini`                |
+| `VAULT_GIT_NAME`     | optional, attributes vault commits to you instead of the bot |
+| `VAULT_GIT_EMAIL`    | optional, pairs with `VAULT_GIT_NAME`         |
 
 `VAULT_REPO` goes in the **Variables** tab, not Secrets — the checkout action
 needs it in plain text, and a repo name isn't a secret. Leave it unset to keep
 the vault in this repo.
+
+By default every vault commit — Notion syncs and your Telegram reviews alike —
+is authored as "DeepRecall Bot". Set `VAULT_GIT_NAME` and `VAULT_GIT_EMAIL` to
+attribute them to yourself instead (optional). Since the workflow file lives in this
+(public) repo, avoid putting a real address in `VAULT_GIT_EMAIL` directly —
+use your GitHub-provided noreply address instead (Settings → Emails → "Keep my
+email address private"), so commits don't expose anything personal.
 
 Secrets are safe in a public repo: workflows triggered from forked pull
 requests never receive them, and `workflow_dispatch` requires write access. The

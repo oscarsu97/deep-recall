@@ -82,12 +82,15 @@ jobs:
           pip install -r requirements.txt
 
       # Applied inside the vault, which is the repo that actually receives
-      # commits under either layout.
+      # commits under either layout. Defaults to the bot identity so the
+      # workflow keeps working before VAULT_GIT_NAME/VAULT_GIT_EMAIL are set;
+      # set those repo variables to attribute every commit (sync + reviews)
+      # to yourself instead.
       - name: Configure git identity
         run: |
           mkdir -p vault
-          git -C vault config user.name  "DeepRecall Bot"
-          git -C vault config user.email "deeprecall@users.noreply.github.com"
+          git -C vault config user.name  "${{ vars.VAULT_GIT_NAME || 'DeepRecall Bot' }}"
+          git -C vault config user.email "${{ vars.VAULT_GIT_EMAIL || 'deeprecall@users.noreply.github.com' }}"
 
       # Ingestion is allowed to fail (expired Notion token, LLM quota) without
       # cancelling the review session — yesterday's cards are still due today.
