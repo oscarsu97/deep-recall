@@ -31,7 +31,7 @@ from telegram.constants import ParseMode
 from telegram.error import Conflict, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-from . import git_sync
+from . import git_sync, topics
 from .config import Config
 from .sm2 import (
     QUALITY_EASY,
@@ -127,6 +127,26 @@ def _truncate(text: str, limit: int = MAX_MESSAGE_CHARS) -> str:
     if cut.count("<code>") > cut.count("</code>"):
         cut += "</code>"
     return cut + "\n\n<i>… (truncated — see the full card in Obsidian)</i>"
+
+
+def resolve_topic_request(request: str, available: set[str]) -> str | None:
+    """Map a typed topic request onto a topic that actually has cards.
+
+    `/review kafka` and `/review spring boot` should work without the user
+    knowing the folder is called "Distributed Systems" or "Java & Spring", so
+    the request goes through the same canonicaliser the synthesiser uses.
+    Returns None when nothing in the vault matches.
+    """
+    # An exact name wins outright: it is unambiguous, and it keeps a vault
+    # carrying a topic from an older taxonomy drillable even though the
+    # canonicaliser would map those same words onto the current vocabulary.
+    lowered = request.casefold()
+    for topic in sorted(available):
+        if topic.casefold() == lowered:
+            return topic
+
+    canonical = topics.canonical(request)
+    return canonical if canonical in available else None
 
 
 def _header(card: Card) -> str:
@@ -252,6 +272,8 @@ class DeepRecallBot:
         await update.effective_message.reply_text(
             "🧠 <b>DeepRecall</b> is listening.\n\n"
             "/review — push the cards due today\n"
+            "/review &lt;topic&gt; — drill one topic, due or not\n"
+            "/topics — what is in the vault\n"
             "/stats — vault overview\n"
             "/due — how many are waiting\n\n"
             f"This chat's id is <code>{chat_id}</code> — put it in <code>TELEGRAM_CHAT_ID</code>.",
@@ -280,11 +302,54 @@ class DeepRecallBot:
             parse_mode=ParseMode.HTML,
         )
 
-    async def cmd_review(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    async def cmd_topics(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        rows = self.vault.topic_counts()
+        if not rows:
+            await update.effective_message.reply_text("The vault is empty.")
+            return
+        listing = "\n".join(
+            f"• <b>{html.escape(topic)}</b> — {total} card(s)"
+            + (f", {due} due" if due else "")
+            for topic, total, due in rows
+        )
+        await update.effective_message.reply_text(
+            f"📚 <b>Topics</b>\n\n{listing}\n\n"
+            "Send <code>/review &lt;topic&gt;</code> to drill one — "
+            "<code>/review kafka</code> and <code>/review spring</code> both work.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def cmd_review(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
-        sent = await self.push_due(chat_id)
-        if not sent:
-            await update.effective_message.reply_text("🎉 Nothing due today.")
+        request = " ".join(context.args or []).strip()
+
+        if not request:
+            sent = await self.push_due(chat_id)
+            if not sent:
+                await update.effective_message.reply_text(
+                    "🎉 Nothing due today. Send /topics to drill a topic anyway."
+                )
+            return
+
+        available = {t for t, _total, _due in self.vault.topic_counts()}
+        topic = resolve_topic_request(request, available)
+        if topic is None:
+            topic = topics.canonical(request)
+            await update.effective_message.reply_text(
+                f"No cards for <b>{html.escape(request)}</b> yet"
+                + (f" (read as <i>{html.escape(topic)}</i>)." if topic != request else ".")
+                + "\n\nSend /topics to see what is in the vault.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        sent = await self.push_due(chat_id, topic=topic)
+        if sent:
+            await update.effective_message.reply_text(
+                f"📖 {sent} card(s) from <b>{html.escape(topic)}</b> — "
+                "due ones first, then what is coming up.",
+                parse_mode=ParseMode.HTML,
+            )
 
     # -- callback handler -------------------------------------------------
 
@@ -353,15 +418,25 @@ class DeepRecallBot:
 
     # -- pushing ----------------------------------------------------------
 
-    async def push_due(self, chat_id: str | int, limit: int | None = None) -> int:
-        """Send one message per due card. Returns how many were delivered."""
+    async def push_due(
+        self, chat_id: str | int, limit: int | None = None, topic: str | None = None
+    ) -> int:
+        """Send one message per card. Returns how many were delivered.
+
+        With `topic`, drills that topic (due cards first, then upcoming ones);
+        otherwise sends whatever is due across the whole vault.
+        """
         from telegram import Bot
         from telegram.request import HTTPXRequest
 
         limit = limit or self.config.max_cards_per_session
-        due = self.vault.due_cards(limit=limit)
+        due = (
+            self.vault.topic_cards(topic, limit=limit)
+            if topic
+            else self.vault.due_cards(limit=limit)
+        )
         if not due:
-            log.info("No cards due today.")
+            log.info("No cards to send%s.", f" for topic {topic!r}" if topic else " today")
             return 0
 
         bot = Bot(
@@ -410,6 +485,7 @@ class DeepRecallBot:
         app.add_handler(CommandHandler("help", self.cmd_start))
         app.add_handler(CommandHandler("stats", self.cmd_stats))
         app.add_handler(CommandHandler("due", self.cmd_due))
+        app.add_handler(CommandHandler("topics", self.cmd_topics))
         app.add_handler(CommandHandler("review", self.cmd_review))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_error_handler(self._on_error)

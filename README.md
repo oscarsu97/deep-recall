@@ -331,6 +331,27 @@ Set `GIT_AUTO_COMMIT=false` in `.env` while experimenting locally.
 In Telegram: `/review` pushes what's due now, `/due` lists it, `/stats` gives
 the vault overview.
 
+### Drilling one topic
+
+`/topics` lists every topic with its card and due counts. `/review <topic>`
+drills one of them:
+
+```
+/review kafka       → Distributed Systems
+/review spring      → Java & Spring
+/review mongodb     → Databases
+```
+
+You don't have to name the folder exactly — the request goes through the same
+canonicaliser the synthesiser uses ([`src/topics.py`](src/topics.py)), so a
+technology name resolves to the topic it belongs to. Naming a topic exactly
+always wins over that guess.
+
+Unlike a plain `/review`, this **includes cards that aren't due yet** — most of
+a topic isn't due on any given day, so filtering to due cards would answer
+almost every request with "nothing to review". Ratings still feed SM-2 normally,
+so drilling a topic reschedules those cards as a real review would.
+
 ---
 
 ## Card schema

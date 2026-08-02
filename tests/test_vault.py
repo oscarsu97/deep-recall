@@ -163,3 +163,69 @@ def test_slugify(raw, expected):
 
 def test_slugify_bounds_length_for_callback_data():
     assert len(slugify("word " * 50, max_length=48)) <= 48
+
+
+# --- topic drilling -------------------------------------------------------
+
+
+def _card(vault, card_id, topic, next_review):
+    vault.save(
+        Card(
+            id=card_id,
+            topic=topic,
+            question=f"Question {card_id}?",
+            sections={"Direct Mechanism": "x"},
+            meta={"id": card_id, "topic": topic, "next_review": next_review.isoformat()},
+        )
+    )
+
+
+def test_topic_cards_filters_to_one_topic(vault):
+    _card(vault, "db-a", "Databases", date(2026, 1, 1))
+    _card(vault, "net-a", "Networking", date(2026, 1, 1))
+
+    assert [c.id for c in vault.topic_cards("Databases", today=date(2026, 7, 29))] == ["db-a"]
+
+
+def test_topic_cards_include_cards_that_are_not_due(vault):
+    # The point of asking for a topic is to drill it now, so a card scheduled
+    # for next year still has to come back.
+    _card(vault, "future", "Databases", date(2027, 1, 1))
+
+    ids = [c.id for c in vault.topic_cards("Databases", today=date(2026, 7, 29))]
+    assert ids == ["future"]
+    assert vault.due_cards(today=date(2026, 7, 29)) == []
+
+
+def test_topic_cards_put_due_before_upcoming(vault):
+    _card(vault, "future", "Databases", date(2027, 1, 1))
+    _card(vault, "overdue", "Databases", date(2026, 1, 1))
+    _card(vault, "due-today", "Databases", date(2026, 7, 29))
+
+    ids = [c.id for c in vault.topic_cards("Databases", today=date(2026, 7, 29))]
+    assert ids == ["overdue", "due-today", "future"]
+
+
+def test_topic_cards_respects_limit(vault):
+    for i in range(5):
+        _card(vault, f"db-{i}", "Databases", date(2026, 1, 1))
+
+    assert len(vault.topic_cards("Databases", limit=2, today=date(2026, 7, 29))) == 2
+
+
+def test_topic_cards_for_unknown_topic_is_empty(vault):
+    assert vault.topic_cards("Basketry", today=date(2026, 7, 29)) == []
+
+
+def test_topic_counts_report_total_and_due_largest_first(vault):
+    _card(vault, "db-a", "Databases", date(2026, 1, 1))
+    _card(vault, "db-b", "Databases", date(2027, 1, 1))
+    _card(vault, "net-a", "Networking", date(2026, 1, 1))
+
+    counts = dict((topic, (total, due)) for topic, total, due in
+                  vault.topic_counts(today=date(2026, 7, 29)))
+    assert counts["Databases"] == (2, 1)
+    assert counts["Networking"] == (1, 1)
+
+    ordered = [topic for topic, _total, _due in vault.topic_counts(today=date(2026, 7, 29))]
+    assert ordered.index("Databases") < ordered.index("Networking")

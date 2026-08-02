@@ -16,6 +16,7 @@ from src.telegram_bot import (
     render_stage_checkpoints,
     render_stage_full,
     render_stage_question,
+    resolve_topic_request,
 )
 from src.vault import Card
 
@@ -201,3 +202,40 @@ def test_other_errors_are_logged_with_a_traceback_and_keep_running(tmp_path, cap
 
     assert stopped == [], "an ordinary error must not kill the poll session"
     assert any(r.exc_info for r in caplog.records)
+
+
+# --- topic requests -------------------------------------------------------
+
+VAULT_TOPICS = {"Distributed Systems", "Java & Spring", "Databases", "Networking"}
+
+
+@pytest.mark.parametrize(
+    "request_text,expected",
+    [
+        ("kafka", "Distributed Systems"),
+        ("spring", "Java & Spring"),
+        ("java", "Java & Spring"),
+        ("mongodb", "Databases"),
+        ("Java & Spring", "Java & Spring"),
+        ("distributed systems", "Distributed Systems"),
+    ],
+)
+def test_topic_requests_resolve_without_naming_the_folder(request_text, expected):
+    assert resolve_topic_request(request_text, VAULT_TOPICS) == expected
+
+
+def test_topic_request_with_no_matching_cards_returns_none():
+    assert resolve_topic_request("basketry", VAULT_TOPICS) is None
+
+
+def test_canonical_topic_absent_from_the_vault_returns_none():
+    # "Concurrency" is in the vocabulary but this vault has no such cards.
+    assert resolve_topic_request("concurrency", VAULT_TOPICS) is None
+
+
+def test_legacy_topic_is_drillable_by_its_exact_name():
+    # A vault still carrying a pre-vocabulary topic can be reached by naming it,
+    # even though the canonicaliser would map the words elsewhere.
+    legacy = VAULT_TOPICS | {"Spring Framework"}
+    assert resolve_topic_request("Spring Framework", legacy) == "Spring Framework"
+    assert resolve_topic_request("spring framework", legacy) == "Spring Framework"

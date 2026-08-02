@@ -491,6 +491,35 @@ class Vault:
         due.sort(key=lambda c: (c.review_state.next_review or date.min, c.id))
         return due[:limit] if limit else due
 
+    def topic_cards(
+        self, topic: str, today: date | None = None, limit: int | None = None
+    ) -> list[Card]:
+        """Cards filed under `topic`, most overdue first, then soonest upcoming.
+
+        Unlike `due_cards` this deliberately includes cards that are *not* yet
+        due. Asking for a topic is a request to drill it now, and on a healthy
+        schedule most of a topic is not due on any given day — filtering to due
+        cards would answer nearly every such request with "nothing to review".
+        """
+        cards = [c for c in self.load_all() if c.topic == topic]
+        cards.sort(
+            key=lambda c: (not c.is_due(today), c.review_state.next_review or date.min, c.id)
+        )
+        return cards[:limit] if limit else cards
+
+    def topic_counts(self, today: date | None = None) -> list[tuple[str, int, int]]:
+        """`(topic, total, due)` per topic, largest first — for menus."""
+        totals: dict[str, int] = {}
+        due: dict[str, int] = {}
+        for card in self.load_all():
+            totals[card.topic] = totals.get(card.topic, 0) + 1
+            if card.is_due(today):
+                due[card.topic] = due.get(card.topic, 0) + 1
+        return sorted(
+            ((t, n, due.get(t, 0)) for t, n in totals.items()),
+            key=lambda row: (-row[1], row[0]),
+        )
+
     def save(self, card: Card) -> Path:
         """Write a card atomically, so a crash mid-write cannot truncate it."""
         path = card.path or self.path_for(card)
