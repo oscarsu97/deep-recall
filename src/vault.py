@@ -50,10 +50,35 @@ SECTION_ORDER = (
     SECTION_ANCHOR,
 )
 
+#: One source note becomes several sibling cards sharing a `cluster`. Splitting
+#: is what makes the SM-2 arithmetic mean anything: a mega-card holds ~8
+#: separately-forgettable claims under one ease factor, so rating it Good
+#: because the mechanism came back also pushes the matrix rows you fumbled out
+#: to thirty days. Siblings are scheduled independently, and the queue shows at
+#: most one per cluster per day so the second is recall rather than
+#: pattern-completion.
+KIND_MECHANISM = "mechanism"
+KIND_DECISION = "decision"
+KIND_TIPPING = "tipping"
+KIND_MODIFIER = "modifier"
+
+#: Short because card ids ride inside Telegram `callback_data` (64 bytes).
+KIND_SUFFIX = {
+    KIND_MECHANISM: "mech",
+    KIND_DECISION: "dec",
+    KIND_TIPPING: "tip",
+    KIND_MODIFIER: "mod",
+}
+
 #: Frontmatter key order — matches the documented schema.
 FRONTMATTER_ORDER = (
     "id",
+    "cluster",
+    "kind",
+    "ordinal",
+    "modifier",
     "topic",
+    "subject",
     "created",
     "next_review",
     "interval",
@@ -198,12 +223,36 @@ class Card:
         self.topic = previous.topic
         self.meta["topic"] = previous.topic
         self.path = previous.path
+        # The LLM rewrites the question, so a regenerated cluster gets a new id
+        # prefix. Siblings are matched by kind, not by id, and the old cluster
+        # label has to come along or the set stops recognising itself.
+        if previous.cluster:
+            self.meta["cluster"] = previous.cluster
 
         for key in REVIEW_STATE_KEYS:
             if key in previous.meta:
                 self.meta[key] = previous.meta[key]
 
     # -- Content accessors used by the Telegram flow ----------------------
+
+    @property
+    def cluster(self) -> str:
+        """The source note this card was split out of. Empty for unsplit cards."""
+        return str(self.meta.get("cluster") or "")
+
+    @property
+    def kind(self) -> str:
+        return str(self.meta.get("kind") or "")
+
+    @property
+    def sibling_key(self) -> tuple[str, int]:
+        """What identifies this sibling within its cluster across a rewrite.
+
+        Not the id: the LLM rewrites the question, so a regenerated cluster is
+        differently slugged. Matching on kind is what lets each sibling inherit
+        its own SM-2 history instead of the whole set starting over.
+        """
+        return self.kind, int(self.meta.get("ordinal") or 0)
 
     @property
     def scenario(self) -> str:
@@ -229,6 +278,18 @@ class Card:
     def constraint_modifiers(self) -> list[str]:
         return _bullets(self.sections.get(SECTION_MODIFIERS, ""))
 
+    def answer_body(self, exclude: tuple[str, ...] = ()) -> str:
+        """Everything on the answer side of the card.
+
+        The scenario is excluded because it belongs to the question — it is
+        already on screen by the time any of this is reachable.
+        """
+        skipped = (SECTION_SCENARIO,) + exclude
+        return "\n".join(
+            body for title, body in self.sections.items()
+            if title not in skipped and body.strip()
+        )
+
     def retrieval_cues(self) -> str:
         """A hint that *provokes* recall instead of replacing it.
 
@@ -239,17 +300,22 @@ class Card:
         answer is built from, plus the decision-matrix *conditions* with their
         choices still redacted. Enough to unstick a stalled retrieval, not
         enough to substitute for one.
+
+        Drawn from whichever sections the card actually has, so a tipping-point
+        or constraint-modifier sibling is cued as well as a mechanism one.
         """
         parts: list[str] = []
 
-        tokens = _cue_tokens(self.direct_mechanism)
+        # The matrix is handled separately: its conditions are the cue and its
+        # choices are the answer, so it must not be mined for tokens.
+        body = self.answer_body(exclude=(SECTION_MATRIX,))
+        tokens = _cue_tokens(body)
         if tokens:
             parts.append("  ·  ".join(tokens))
-        elif self.direct_mechanism:
-            # Nothing quotable in the mechanism — fall back to an opening-words
-            # cue, which is still a cue rather than the answer.
-            opening = " ".join(self.direct_mechanism.split()[:8])
-            parts.append(f"{opening} …")
+        elif body:
+            # Nothing quotable — fall back to an opening-words cue, which is
+            # still a cue rather than the answer.
+            parts.append(" ".join(body.split()[:8]) + " …")
 
         conditions = [cond for cond in (_condition_of(b) for b in self.decision_matrix) if cond]
         if conditions:
@@ -345,6 +411,145 @@ def _condition_of(bullet: str) -> str:
     if sep and len(head) < 120:
         return head.strip().strip("*")
     return ""
+
+
+def _lead_and_rest(bullet: str) -> tuple[str, str]:
+    """`"*Modifier 1 (Strict Ordering):* Pause it" -> ("Modifier 1 (Strict Ordering)", "Pause it")`."""
+    match = _BOLD_LEAD.match(bullet) or _ITALIC_LEAD.match(bullet)
+    if match:
+        return match.group("lead").strip(), match.group("rest").strip()
+    head, sep, tail = bullet.partition(":")
+    if sep and len(head) < 120:
+        return head.strip().strip("*"), tail.strip()
+    return "", bullet.strip()
+
+
+_MODIFIER_LABEL = re.compile(r"^Modifier\s+\d+\s*\((?P<name>.+)\)$", re.IGNORECASE)
+
+
+def _modifier_name(lead: str, ordinal: int) -> str:
+    """`"Modifier 2 (Strict Ordering)" -> "Strict Ordering"`."""
+    match = _MODIFIER_LABEL.match(lead.strip())
+    if match:
+        return match.group("name").strip()
+    return lead.strip() or f"Constraint {ordinal}"
+
+
+# ---------------------------------------------------------------------------
+# Splitting one note into sibling cards
+# ---------------------------------------------------------------------------
+
+
+def _sibling_question(parent: str, subject: str, kind: str, modifier: str = "") -> str:
+    """The question a sibling asks on its own, with no parent card to lean on.
+
+    With a `subject` the questions stand alone cleanly. Without one — cards
+    generated before the subject field existed, and anything hand-written — the
+    parent question is reused as the stem, which is wordier but never wrong.
+    """
+    if kind == KIND_MECHANISM:
+        return parent
+
+    if subject:
+        if kind == KIND_DECISION:
+            return f"Which constraint changes how you use {subject}, and what does each choice cost?"
+        if kind == KIND_TIPPING:
+            return f"When is {subject} the wrong answer, and what wins instead?"
+        return f"{modifier} now holds. How must {subject} change, and why?"
+
+    stem = parent.strip().rstrip("?").strip()
+    if kind == KIND_DECISION:
+        return f"{stem} — which constraint changes the choice, and what does each cost?"
+    if kind == KIND_TIPPING:
+        return f"{stem} — when is this the wrong approach, and what wins instead?"
+    return f"{stem} — {modifier} now holds: what changes, and why?"
+
+
+def split_card(card: Card, today: date | None = None, fresh_schedule: bool = True) -> list[Card]:
+    """Split one card into independently scheduled sibling cards.
+
+    The four sections of a DeepRecall card are four different questions about
+    one mechanism, and they are forgotten at four different rates. Kept
+    together they share a single ease factor, so partial failure is laundered
+    into full success — the real reason a long card never quite lands. Kept
+    apart, the constraint modifier you keep missing comes back in two days
+    while the mechanism you know goes to thirty.
+
+    With `fresh_schedule` every sibling starts new; the migration passes False
+    so existing review history is inherited rather than thrown away.
+
+    An already-split card (or one with nothing to split) is returned unchanged.
+    """
+    if card.kind:
+        return [card]
+
+    today = today or date.today()
+    cluster = str(card.meta.get("cluster") or card.id)
+    subject = str(card.meta.get("subject") or "").strip()
+    scenario = card.scenario
+
+    plan: list[tuple[str, str, int, str, dict[str, str]]] = []
+
+    if card.direct_mechanism:
+        sections = {SECTION_MECHANISM: card.direct_mechanism}
+        if card.anchor:
+            sections[SECTION_ANCHOR] = card.anchor
+        plan.append((KIND_MECHANISM, KIND_SUFFIX[KIND_MECHANISM], 0, "", sections))
+
+    # The matrix stays whole. Its rows are only meaningful against each other —
+    # splitting them would destroy the comparison that makes it a decision.
+    matrix = card.sections.get(SECTION_MATRIX, "").strip()
+    if matrix:
+        plan.append((KIND_DECISION, KIND_SUFFIX[KIND_DECISION], 0, "", {SECTION_MATRIX: matrix}))
+
+    if card.tipping_point:
+        plan.append((KIND_TIPPING, KIND_SUFFIX[KIND_TIPPING], 0, "",
+                     {SECTION_TIPPING_POINT: card.tipping_point}))
+
+    for i, bullet in enumerate(card.constraint_modifiers, 1):
+        lead, rest = _lead_and_rest(bullet)
+        name = _modifier_name(lead, i)
+        plan.append((KIND_MODIFIER, f"{KIND_SUFFIX[KIND_MODIFIER]}{i}", i, name,
+                     {SECTION_MODIFIERS: rest or bullet}))
+
+    if len(plan) < 2:
+        return [card]
+
+    siblings: list[Card] = []
+    for kind, suffix, ordinal, modifier, sections in plan:
+        meta = dict(card.meta)
+        meta.pop("body_hash", None)
+        meta.pop("path", None)
+        sibling_id = f"{cluster}-{suffix}"
+        meta.update({"id": sibling_id, "cluster": cluster, "kind": kind})
+        if ordinal:
+            meta["ordinal"] = ordinal
+        if modifier:
+            meta["modifier"] = modifier
+        if fresh_schedule:
+            meta.update({
+                "created": today.isoformat(),
+                "next_review": today.isoformat(),
+                "interval": 0,
+                "ease_factor": DEFAULT_EASE_FACTOR,
+                "repetition_count": 0,
+            })
+            meta.pop("last_reviewed", None)
+
+        body = {SECTION_SCENARIO: scenario} if scenario else {}
+        body.update(sections)
+
+        sibling = Card(
+            id=sibling_id,
+            topic=card.topic,
+            question=_sibling_question(card.question, subject, kind, modifier),
+            sections=body,
+            meta=meta,
+        )
+        sibling.meta["body_hash"] = sibling.body_digest()
+        siblings.append(sibling)
+
+    return siblings
 
 
 # ---------------------------------------------------------------------------
@@ -528,21 +733,36 @@ class Vault:
         return set(self.index_by_source())
 
     def index_by_source(self) -> dict[str, Card]:
-        """Map every identifier a note could match on to its existing card.
+        """Map every identifier a note could match on to one of its cards.
 
         Keys are the Notion block id (stable when you reword a question), the
         slug of the original question (legacy cards predating block ids), and
         the card's own id.
         """
-        index: dict[str, Card] = {}
-        for card in self.load_all():
-            for key in (
-                card.meta.get("source_block_id"),
-                card.meta.get("source_note_id"),
-                card.id,
-            ):
-                if key:
-                    index.setdefault(str(key), card)
+        return {key: siblings[0] for key, siblings in self.index_clusters_by_source().items()}
+
+    def index_clusters_by_source(self) -> dict[str, list[Card]]:
+        """As `index_by_source`, but every sibling cut from the note.
+
+        A note now produces a cluster of cards rather than one, so matching a
+        note to "its card" is no longer well defined — regeneration has to see
+        the whole set to carry each sibling's own schedule across and to notice
+        siblings that no longer have a counterpart.
+        """
+        index: dict[str, list[Card]] = {}
+        for card in sorted(self.load_all(), key=lambda c: c.id):
+            keys = {
+                str(key)
+                for key in (
+                    card.meta.get("source_block_id"),
+                    card.meta.get("source_note_id"),
+                    card.cluster,
+                    card.id,
+                )
+                if key
+            }
+            for key in keys:
+                index.setdefault(key, []).append(card)
         return index
 
     def due_cards(
@@ -550,8 +770,16 @@ class Vault:
         today: date | None = None,
         limit: int | None = None,
         new_limit: int | None = None,
+        bury_siblings: bool = True,
     ) -> list[Card]:
         """Cards with `next_review <= today`, most overdue first.
+
+        `bury_siblings` holds the queue to one card per cluster per day. Two
+        cards cut from the same note prime each other: having just recalled the
+        mechanism, the tipping point is pattern-completion rather than
+        retrieval, and it earns an interval it has not paid for. Buried
+        siblings are not skipped — they are already overdue, so they lead
+        tomorrow's queue.
 
         `new_limit` caps how many of them may be cards you have never rated.
         A first pass costs minutes and a repeat costs seconds, so a queue
@@ -563,6 +791,17 @@ class Vault:
         """
         due = [card for card in self.load_all() if card.is_due(today)]
         due.sort(key=lambda c: (c.review_state.next_review or date.min, c.id))
+
+        if bury_siblings:
+            seen_clusters: set[str] = set()
+            kept = []
+            for card in due:
+                if card.cluster:
+                    if card.cluster in seen_clusters:
+                        continue
+                    seen_clusters.add(card.cluster)
+                kept.append(card)
+            due = kept
 
         if new_limit is not None:
             kept: list[Card] = []
@@ -622,11 +861,23 @@ class Vault:
         card.path = path
         return path
 
+    def delete(self, card: Card) -> Path | None:
+        """Remove a card's file. Returns the path removed, or None if absent."""
+        path = card.path or self.path_for(card)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise VaultError(f"Could not delete {path}: {exc}") from exc
+        return path
+
     def stats(self, today: date | None = None) -> dict[str, int]:
         cards = self.load_all()
         today = today or date.today()
         return {
             "total": len(cards),
+            "clusters": len({c.cluster or c.id for c in cards}),
             "due": sum(1 for c in cards if c.is_due(today)),
             "new": sum(1 for c in cards if c.review_state.repetition_count == 0),
             "mature": sum(1 for c in cards if c.review_state.interval >= 21),

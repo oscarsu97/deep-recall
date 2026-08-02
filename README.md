@@ -36,6 +36,40 @@ The **Scenario** is deliberately on the question side. An example appended to
 an answer makes the card longer and still tests recitation; a concrete
 situation used as the prompt makes the card shorter and tests transfer.
 
+### One note becomes a cluster, not a card
+
+Shortening the prose only fixes half of it. Those sections are four *different
+questions* about one mechanism, forgotten at four different rates, and a single
+card gives them a single ease factor — so partial failure is laundered into
+full success. Each note is therefore cut into siblings that share a `cluster`
+and schedule independently:
+
+```
+ note ──┬─ <id>-mech    the mechanism
+        ├─ <id>-dec     the decision matrix, kept whole — its rows are
+        │               only meaningful against each other
+        ├─ <id>-tip     the tipping point
+        ├─ <id>-mod1    one constraint modifier
+        └─ <id>-mod2    the other
+```
+
+The modifier you keep missing now comes back in two days while the mechanism
+you know goes to thirty. Counter-intuitively this *lowers* the daily load: once
+the siblings drift apart, a typical day surfaces two of five rather than all of
+them.
+
+The queue shows **at most one card per cluster per day**. Having just recalled
+the mechanism, its tipping point is pattern-completion rather than retrieval,
+and would earn an interval it has not paid for. Buried siblings are not
+dropped — they are already overdue, so they lead the next day's queue.
+Drilling a topic on demand (`/review kafka`) does not bury: asking for a
+subject is a request to go through it.
+
+Existing vaults are split in place by
+[`scripts/split_clusters.py`](scripts/split_clusters.py), which needs no LLM
+call — the sections are already on disk — and gives every sibling the parent's
+review history rather than restarting it at zero.
+
 ---
 
 ## Architecture
@@ -49,17 +83,18 @@ flowchart TB
 
     subgraph Synth["2 · Synthesis  (src/synthesizer.py)"]
         RN --> LLM{{"Gemini Flash / Groq Llama<br/>JSON mode"}}
-        LLM --> L[Quality linter<br/>buzzwords · structure]
+        LLM --> L[Quality linter<br/>buzzwords · word budgets · structure]
         L -->|violations| LLM
-        L -->|clean| MD[Markdown renderer]
+        L -->|clean| SP[Cluster splitter<br/>1 note → 4-5 sibling cards]
+        SP --> MD[Markdown renderer]
     end
 
     subgraph Store["3 · Obsidian Vault  (src/vault.py)"]
-        MD --> V[("vault/&lt;topic&gt;/&lt;id&gt;.md<br/>YAML frontmatter = SM-2 state")]
+        MD --> V[("vault/&lt;topic&gt;/&lt;id&gt;-&lt;kind&gt;.md<br/>YAML frontmatter = SM-2 state")]
     end
 
     subgraph Review["4 · Scheduling  (src/sm2.py)"]
-        V -->|next_review &lt;= today| DUE[Due queue]
+        V -->|next_review &lt;= today| DUE[Due queue<br/>1 per cluster · 5 new max]
         DUE --> TG
         SM[SM-2: interval · ease · reps] --> V
     end
@@ -129,15 +164,19 @@ deep-recall/
 │   ├── config.py          Env-backed config + per-command credential validation
 │   ├── ingestion.py       Notion API → RawNote (toggles, headings, '?' bullets)
 │   ├── synthesizer.py     Prompt, Gemini/Groq providers, quality linter, renderer
-│   ├── vault.py           Card model, YAML frontmatter round-trip, due queries
+│   ├── vault.py           Card model, cluster splitting, frontmatter round-trip, due queries
+│   ├── topics.py          Canonical topic vocabulary
 │   ├── sm2.py             Pure SM-2 — no I/O, no globals
 │   ├── telegram_bot.py    Inline-keyboard state machine, push + poll entry points
 │   ├── git_sync.py        Commit/push a rated card
 │   └── main.py            CLI
+├── scripts/
+│   ├── retopic.py         Re-file cards after editing the topic vocabulary
+│   └── split_clusters.py  Split pre-cluster mega-cards into siblings, in place
 ├── examples/
-│   └── kafka-retry-patterns.md    ← what a generated card looks like
+│   └── kafka-retry-patterns-*.md  ← the five cards one Notion note becomes
 ├── vault/                 your flashcards — git-ignored, see "Where your notes live"
-├── tests/                 97 tests, no network required
+├── tests/                 203 tests, no network required
 ├── .github/workflows/daily_sync.yml
 ├── .env.example
 └── requirements.txt

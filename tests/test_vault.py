@@ -202,6 +202,70 @@ def test_due_cards_without_a_new_limit_are_unfiltered(vault):
     assert len(vault.due_cards(today=date(2026, 7, 29))) == 3
 
 
+def _sibling(vault, cluster, kind, next_review, repetition_count=0):
+    card_id = f"{cluster}-{kind}"
+    vault.save(
+        Card(
+            id=card_id,
+            topic="Databases",
+            question=f"Question {card_id}?",
+            sections={"Direct Mechanism": "x"},
+            meta={
+                "id": card_id, "topic": "Databases", "cluster": cluster, "kind": kind,
+                "next_review": next_review.isoformat(),
+                "repetition_count": repetition_count,
+            },
+        )
+    )
+
+
+def test_only_one_sibling_per_cluster_surfaces_in_a_day(vault):
+    """Having just recalled the mechanism, the tipping point is
+    pattern-completion rather than retrieval — and would earn an interval it
+    has not paid for."""
+    for kind in ("mech", "dec", "tip", "mod1"):
+        _sibling(vault, "scd2", kind, date(2026, 1, 1))
+    _sibling(vault, "kafka", "mech", date(2026, 1, 1))
+
+    due = vault.due_cards(today=date(2026, 7, 29))
+    assert sorted(c.cluster for c in due) == ["kafka", "scd2"]
+
+
+def test_buried_siblings_are_deferred_not_dropped(vault):
+    for kind in ("mech", "dec", "tip"):
+        _sibling(vault, "scd2", kind, date(2026, 1, 1))
+
+    unburied = vault.due_cards(today=date(2026, 7, 29), bury_siblings=False)
+    assert len([c for c in unburied if c.cluster == "scd2"]) == 3
+    # They are already overdue, so they lead the queue on the following days.
+    later = vault.due_cards(today=date(2026, 7, 30))
+    assert len([c for c in later if c.cluster == "scd2"]) == 1
+
+
+def test_burying_keeps_the_most_overdue_sibling(vault):
+    _sibling(vault, "scd2", "tip", date(2026, 6, 1))
+    _sibling(vault, "scd2", "mech", date(2026, 1, 1))
+
+    due = vault.due_cards(today=date(2026, 7, 29))
+    assert [c.id for c in due] == ["scd2-mech"]
+
+
+def test_unsplit_cards_are_never_buried_against_each_other(vault):
+    """No cluster means no sibling relationship — they must all stay visible."""
+    _due_card(vault, "a", date(2026, 1, 1), repetition_count=0)
+    _due_card(vault, "b", date(2026, 1, 1), repetition_count=0)
+
+    assert len(vault.due_cards(today=date(2026, 7, 29))) == 2
+
+
+def test_drilling_a_topic_does_not_bury_siblings(vault):
+    """Asking for a topic is a request to go through it, not to be paced."""
+    for kind in ("mech", "dec", "tip"):
+        _sibling(vault, "scd2", kind, date(2026, 1, 1))
+
+    assert len(vault.topic_cards("Databases", today=date(2026, 7, 29))) == 3
+
+
 def test_unparseable_cards_are_skipped_not_fatal(vault, caplog):
     (vault.root / "broken.md").write_text("---\n: : not yaml : :\n---\nbody", encoding="utf-8")
     assert vault.load_all()  # the good card still loads

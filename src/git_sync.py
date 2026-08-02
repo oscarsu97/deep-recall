@@ -48,13 +48,25 @@ def _ensure_identity(repo: Path) -> None:
     _run(["git", "config", "user.name", BOT_NAME], repo)
 
 
-def commit_paths(paths: list[Path], message: str, repo: Path, push: bool = True) -> bool:
+def commit_paths(
+    paths: list[Path],
+    message: str,
+    repo: Path,
+    push: bool = True,
+    removals: list[Path] | None = None,
+) -> bool:
     """Stage, commit and (optionally) push `paths`. Returns True if a commit was made.
+
+    `removals` are paths deleted on purpose — a regenerated note that no longer
+    has a third constraint modifier, say. They are staged with `git add -A`,
+    which records a deletion where a plain `git add` on a vanished path would
+    abort.
 
     `repo` should be the vault directory; git resolves the repository from it.
     """
     paths = [p for p in paths if p]
-    if not paths:
+    removals = [p for p in (removals or []) if p]
+    if not paths and not removals:
         return False
 
     if not repo.exists() or not is_repo(repo):
@@ -70,14 +82,22 @@ def commit_paths(paths: list[Path], message: str, repo: Path, push: bool = True)
     for missing in [p for p in paths if not p.exists()]:
         log.warning("Expected to commit %s but it is not on disk; skipping it.", missing)
 
-    if not present:
+    if not present and not removals:
         log.error("None of the %d path(s) to commit exist on disk.", len(paths))
         return False
 
-    add = _run(["git", "add", "--", *[str(p) for p in present]], repo)
-    if add.returncode != 0:
-        log.error("git add failed: %s", add.stderr.strip())
-        return False
+    if present:
+        add = _run(["git", "add", "--", *[str(p) for p in present]], repo)
+        if add.returncode != 0:
+            log.error("git add failed: %s", add.stderr.strip())
+            return False
+
+    for gone in removals:
+        # Tolerated individually: a path git never tracked makes `add` fail, and
+        # that must not cost us the rest of the commit.
+        staged_removal = _run(["git", "add", "-A", "--", str(gone)], repo)
+        if staged_removal.returncode != 0:
+            log.warning("Could not stage deletion of %s: %s", gone, staged_removal.stderr.strip())
 
     staged = _run(["git", "diff", "--cached", "--quiet"], repo)
     if staged.returncode == 0:

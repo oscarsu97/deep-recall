@@ -61,61 +61,70 @@ def _plan_sync(
     """Decide, per ingested note, whether to create, regenerate, or skip.
 
     Returns `(pending, backfilled)` where `pending` is a list of
-    `(note, existing_card_or_None)` and `backfilled` counts pre-existing cards
-    that gained provenance metadata without needing an LLM call.
+    `(note, existing_siblings)` — the cards already cut from that note, empty
+    for a note seen for the first time — and `backfilled` counts pre-existing
+    cards that gained provenance metadata without needing an LLM call.
 
-    A note is matched to an existing card by Notion block id first (stable when
-    you reword the question) and by question slug second (cards created before
-    block ids were recorded).
+    A note is matched to its cards by Notion block id first (stable when you
+    reword the question) and by question slug second (cards created before
+    block ids were recorded). One note now yields several sibling cards, so
+    what comes back is the whole cluster: each sibling carries its own SM-2
+    state across a regeneration, and a sibling with no counterpart in the new
+    output has to be pruned rather than orphaned.
     """
     if force:
-        return [(note, None) for note in notes], 0
+        return [(note, []) for note in notes], 0
 
-    index = vault.index_by_source()
+    index = vault.index_clusters_by_source()
     pending: list[tuple] = []
     backfilled = 0
 
     for note in notes:
-        existing = index.get(note.block_id) if note.block_id else None
-        existing = existing or index.get(note.suggested_id)
+        siblings = (index.get(note.block_id) if note.block_id else None) or []
+        siblings = siblings or index.get(note.suggested_id) or []
 
-        if existing is None:
-            pending.append((note, None))
+        if not siblings:
+            pending.append((note, []))
             continue
 
-        stored_hash = existing.meta.get("source_hash")
+        # Siblings are written together, so any of them answers for the set.
+        stored_hash = next(
+            (s.meta.get("source_hash") for s in siblings if s.meta.get("source_hash")), None
+        )
         if not stored_hash:
-            # Card predates content hashing. We cannot tell whether the note
+            # Cards predate content hashing. We cannot tell whether the note
             # changed, so assume not — regenerating everything on upgrade would
             # be a nasty surprise — but record the hash so edits are caught from
             # now on.
             if not backfill:
-                log.debug("• would backfill provenance: %s", existing.id)
+                log.debug("• would backfill provenance: %s", siblings[0].id)
                 continue
-            existing.meta["source_hash"] = note.content_hash
-            if note.block_id:
-                existing.meta.setdefault("source_block_id", note.block_id)
-            existing.meta.setdefault("body_hash", existing.body_digest())
-            try:
-                vault.save(existing)
-                backfilled += 1
-            except VaultError as exc:
-                log.warning("Could not backfill provenance for %s: %s", existing.id, exc)
+            for card in siblings:
+                card.meta["source_hash"] = note.content_hash
+                if note.block_id:
+                    card.meta.setdefault("source_block_id", note.block_id)
+                card.meta.setdefault("body_hash", card.body_digest())
+                try:
+                    vault.save(card)
+                    backfilled += 1
+                except VaultError as exc:
+                    log.warning("Could not backfill provenance for %s: %s", card.id, exc)
             continue
 
         if str(stored_hash) == note.content_hash:
-            log.debug("• unchanged: %s", existing.id)
+            log.debug("• unchanged: %s", siblings[0].id)
             continue
 
-        if existing.is_hand_edited():
+        edited = [s for s in siblings if s.is_hand_edited()]
+        if edited:
             log.warning(
-                "• %s changed in Notion, but the card was edited in Obsidian — "
-                "skipping to protect your edits (use --force to overwrite).",
-                existing.id,
+                "• %s changed in Notion, but %s was edited in Obsidian — "
+                "skipping the whole cluster to protect your edits (use --force to overwrite).",
+                siblings[0].cluster or siblings[0].id, edited[0].id,
             )
             continue
 
-        pending.append((note, existing))
+        pending.append((note, siblings))
 
     return pending, backfilled
 
@@ -153,7 +162,7 @@ def cmd_sync(config: Config, args: argparse.Namespace) -> int:
     if args.limit:
         pending = pending[: args.limit]
 
-    new_count = sum(1 for _, existing in pending if existing is None)
+    new_count = sum(1 for _, existing in pending if not existing)
     log.info(
         "%d note(s) to synthesise — %d new, %d changed (%d ingested)",
         len(pending), new_count, len(pending) - new_count, len(notes),
@@ -161,7 +170,7 @@ def cmd_sync(config: Config, args: argparse.Namespace) -> int:
 
     if args.dry_run:
         for note, existing in pending:
-            marker = "NEW" if existing is None else f"CHANGED -> {existing.id}"
+            marker = "NEW" if not existing else f"CHANGED -> {existing[0].cluster or existing[0].id}"
             print(f"\n--- {note.suggested_id} [{note.suggested_topic}]  ({marker})")
             print(f"Q: {note.question}")
             print(note.raw_answer[:500])
@@ -172,14 +181,15 @@ def cmd_sync(config: Config, args: argparse.Namespace) -> int:
 
     synthesizer = Synthesizer(config)
     written: list[Path] = []
+    removed: list[Path] = []
     failures = 0
     quota_hit = False
 
     for i, (note, existing) in enumerate(pending, 1):
-        verb = "synthesising" if existing is None else "regenerating"
+        verb = "synthesising" if not existing else "regenerating"
         log.info("[%d/%d] %s: %s", i, len(pending), verb, note.question[:70])
         try:
-            card = synthesizer.synthesize(note)
+            cards = synthesizer.synthesize(note)
         except QuotaExhaustedError as exc:
             # Every remaining note would fail identically; stop rather than
             # spend the next ten minutes proving it.
@@ -197,21 +207,43 @@ def cmd_sync(config: Config, args: argparse.Namespace) -> int:
             failures += 1
             continue
 
-        if existing is not None:
-            # Same card, new content: keep its id, file location and schedule.
-            card.carry_review_state_from(existing)
-            card.meta["revised"] = date.today().isoformat()
+        # Same note, new content: each sibling keeps its own id, file location
+        # and schedule, matched to its counterpart by kind.
+        previous = {c.sibling_key: c for c in existing}
+        for card in cards:
+            twin = previous.pop(card.sibling_key, None)
+            if twin is not None:
+                card.carry_review_state_from(twin)
+                card.meta["revised"] = date.today().isoformat()
 
-        try:
-            path = vault.save(card)
-        except VaultError as exc:
-            log.error("  ✗ could not write card: %s", exc)
-            failures += 1
-            continue
-        log.info("  ✓ %s", _display(path))
-        written.append(path)
+        wrote_any = False
+        for card in cards:
+            try:
+                path = vault.save(card)
+            except VaultError as exc:
+                log.error("  ✗ could not write %s: %s", card.id, exc)
+                failures += 1
+                continue
+            log.info("  ✓ %s", _display(path))
+            written.append(path)
+            wrote_any = True
 
-    if written and config.git_auto_commit:
+        # Siblings with no counterpart in the new output — the note lost a
+        # constraint modifier, say. Leaving them behind would keep scheduling a
+        # question the note no longer answers. Only prune once the replacements
+        # are safely on disk.
+        if wrote_any:
+            for orphan in previous.values():
+                try:
+                    path = vault.delete(orphan)
+                except VaultError as exc:
+                    log.warning("  ! could not remove stale sibling %s: %s", orphan.id, exc)
+                    continue
+                if path:
+                    log.info("  – removed stale sibling %s", _display(path))
+                    removed.append(path)
+
+    if (written or removed) and config.git_auto_commit:
         from . import git_sync
 
         git_sync.commit_paths(
@@ -219,10 +251,12 @@ def cmd_sync(config: Config, args: argparse.Namespace) -> int:
             f"sync: add {len(written)} card(s) from Notion ({date.today().isoformat()})",
             repo=config.vault_dir,
             push=not args.no_push,
+            removals=removed,
         )
 
-    log.info("Sync complete: %d card(s) written, %d failure(s)%s",
-             len(written), failures, " (stopped early: quota)" if quota_hit else "")
+    log.info("Sync complete: %d card(s) written, %d removed, %d failure(s)%s",
+             len(written), len(removed), failures,
+             " (stopped early: quota)" if quota_hit else "")
     # Partial success is still success; only a total wipe-out is an error.
     return 1 if failures and not written else 0
 
@@ -254,11 +288,17 @@ def cmd_bot_poll(config: Config, args: argparse.Namespace) -> int:
 def cmd_stats(config: Config, _: argparse.Namespace) -> int:
     vault = Vault(config.vault_dir)
     stats = vault.stats()
-    due = vault.due_cards()
+    # What `--notify` would actually deliver, which is the number that matters:
+    # the raw backlog counts every sibling of every cluster and reads as alarming.
+    due = vault.due_cards(
+        limit=config.max_cards_per_session, new_limit=config.max_new_cards_per_session
+    )
 
     print(f"\n📊 DeepRecall vault — {config.vault_dir}")
-    print(f"   cards         {stats['total']}  across {stats['topics']} topic(s)")
-    print(f"   due today     {stats['due']}")
+    print(f"   cards         {stats['total']}  across {stats['topics']} topic(s), "
+          f"{stats['clusters']} cluster(s)")
+    print(f"   next session  {len(due)}  (of {stats['due']} due — one per cluster, "
+          f"max {config.max_new_cards_per_session} new)")
     print(f"   never seen    {stats['new']}")
     print(f"   mature ≥21d   {stats['mature']}\n")
 

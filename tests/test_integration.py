@@ -55,35 +55,39 @@ def test_full_pipeline(tmp_path):
     assert len(notes) == 1
     assert "sendfile(2)" in notes[0].raw_answer
 
-    # 2. Synthesise into a card.
+    # 2. Synthesise into a cluster of sibling cards.
     synthesizer = Synthesizer(config, provider=FakeProvider(json.dumps(GOOD_CARD)))
-    card = synthesizer.synthesize(notes[0])
-    path = vault.save(card)
+    cards = synthesizer.synthesize(notes[0])
+    paths = [vault.save(card) for card in cards]
 
-    assert path.exists()
-    assert path.parent.name == "distributed-systems"
-    assert path.read_text(encoding="utf-8").startswith("---\n")
+    assert len(cards) == 5
+    for path in paths:
+        assert path.exists()
+        assert path.parent.name == "distributed-systems"
+        assert path.read_text(encoding="utf-8").startswith("---\n")
 
-    # 3. A brand-new card is due immediately.
+    # 3. All five are new, but only one surfaces today — siblings are buried so
+    #    the second is recall rather than pattern-completion.
     due = vault.due_cards(today=TODAY)
-    assert [c.id for c in due] == ["kafka-retry-patterns"]
+    assert [c.id for c in due] == ["kafka-retry-patterns-dec"]
+    assert len(vault.due_cards(today=TODAY, bury_siblings=False)) == 5
 
-    # 4. Walk the Telegram reveal flow, reloading from disk at each stage the
-    #    way a restarted bot process would.
-    loaded = vault.find("kafka-retry-patterns")
+    # 4. Walk the Telegram reveal flow on the mechanism sibling, reloading from
+    #    disk at each stage the way a restarted bot process would.
+    loaded = vault.find("kafka-retry-patterns-mech")
     question_text, keyboard = render_stage_question(loaded)
+    assert "lag alert fires at 03:00" in question_text   # the scenario sets it up
     assert "orders-retry-30s" not in question_text
 
     reveal = Callback.decode(keyboard.inline_keyboard[0][0].callback_data)
-    checkpoint_text, keyboard = render_stage_checkpoints(vault.find(reveal.card_id))
-    assert "orders-retry-30s" in checkpoint_text
+    cue_text, keyboard = render_stage_checkpoints(vault.find(reveal.card_id))
+    assert "orders-retry-30s" in cue_text                 # the identifier is the cue
+    assert "commit the original offset" not in cue_text   # the prose is not
 
-    shift = Callback.decode(keyboard.inline_keyboard[0][0].callback_data)
-    shifted_text, _ = render_stage_checkpoints(vault.find(shift.card_id), modifier_index=shift.arg)
-    assert "Constraint Shift" in shifted_text
-
-    full_text, keyboard = render_stage_full(vault.find(shift.card_id))
-    assert "RabbitMQ" in full_text
+    full_text, keyboard = render_stage_full(vault.find(reveal.card_id))
+    assert "commit the original offset" in full_text
+    # This sibling answers the mechanism only; the tipping point is its own card.
+    assert "RabbitMQ" not in full_text
 
     # 5. Rate it "Good" and persist.
     rating = Callback.decode(keyboard.inline_keyboard[0][1].callback_data)
@@ -95,12 +99,13 @@ def test_full_pipeline(tmp_path):
     graded.apply_review(review(graded.review_state, rating.arg, today=TODAY), reviewed_on=TODAY)
     vault.save(graded)
 
-    # 6. It is no longer due, and the schedule landed on disk.
-    reloaded = vault.find("kafka-retry-patterns")
+    # 6. It is no longer due, and the schedule landed on disk — while its
+    #    siblings kept their own, untouched.
+    reloaded = vault.find("kafka-retry-patterns-mech")
     assert reloaded.review_state.next_review == TODAY + timedelta(days=1)
     assert reloaded.review_state.repetition_count == 1
-    assert vault.due_cards(today=TODAY) == []
-    assert vault.due_cards(today=TODAY + timedelta(days=1))
+    assert vault.find("kafka-retry-patterns-tip").review_state.repetition_count == 0
+    assert "kafka-retry-patterns-mech" not in [c.id for c in vault.due_cards(today=TODAY)]
 
 
 def test_resync_skips_notes_already_in_the_vault(tmp_path):
@@ -109,14 +114,18 @@ def test_resync_skips_notes_already_in_the_vault(tmp_path):
     vault.ensure()
 
     notes = NotionIngestor(config, client=FakeNotion(PAGE, NOTION_BLOCKS)).fetch_notes()
-    card = Synthesizer(config, provider=FakeProvider(json.dumps(GOOD_CARD))).synthesize(notes[0])
-    vault.save(card)
+    cards = Synthesizer(config, provider=FakeProvider(json.dumps(GOOD_CARD))).synthesize(notes[0])
+    for card in cards:
+        vault.save(card)
 
-    # The LLM rewrote the question, so the card id differs from the note slug…
-    assert card.id != notes[0].suggested_id
-    # …and only `source_note_id` makes the second run recognise it.
+    # The LLM rewrote the question, so the card ids differ from the note slug…
+    assert all(c.id != notes[0].suggested_id for c in cards)
+    # …and only `source_note_id` makes the second run recognise them.
     assert notes[0].suggested_id in vault.known_ids()
-    assert card.id in vault.known_ids()
+    assert all(c.id in vault.known_ids() for c in cards)
+    # One note, one cluster, however many siblings it was cut into.
+    found = vault.index_clusters_by_source()[notes[0].suggested_id]
+    assert {c.id for c in found} == {c.id for c in cards}
 
     # A second identical ingest must therefore produce nothing to synthesise.
     again = NotionIngestor(config, client=FakeNotion(PAGE, NOTION_BLOCKS)).fetch_notes()

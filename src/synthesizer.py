@@ -37,6 +37,7 @@ from .vault import (
     SECTION_TIPPING_POINT,
     Card,
     slugify,
+    split_card,
 )
 
 log = logging.getLogger(__name__)
@@ -142,6 +143,11 @@ fences. Schema (word budgets are enforced by a linter):
   "topic": "Pick the single best fit from this list, copied verbatim: \
 __TOPIC_LIST__. Do not invent a new topic or a narrower variant of one of \
 these — the topic is a folder name, and new labels fragment the collection.",
+  "subject": "MAX 6 WORDS. The thing this card is about, as a bare noun \
+phrase — 'Kafka retry topics', 'SCD Type 2', 'the page cache'. The card is \
+split into several independently scheduled siblings and this is what each of \
+their questions is phrased around, so it must read naturally after 'When is \
+___ the wrong answer?'.",
   "scenario": "MAX 45 WORDS. A concrete situation in which this knowledge is \
 the thing you need, written in the second person and set at a real moment: an \
 on-call page, a code review, a number in a report that came back wrong, a \
@@ -240,6 +246,7 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?;])\s+|\n")
 #: which turns a review into re-reading and puts ~8 separately-forgettable
 #: propositions under one SM-2 ease factor. The budgets below target ~150.
 MAX_WORDS = {
+    "subject": 6,
     "scenario": 45,
     "question": 25,
     "direct_mechanism": 60,
@@ -296,6 +303,15 @@ def lint_card(data: dict[str, Any]) -> list[str]:
     if question.lower().startswith(("is ", "are ", "does ", "do ", "can ", "should ")):
         problems.append("`question` is a yes/no question; rewrite it to demand a mechanism.")
     _check_budget(problems, "question", "question", question)
+
+    subject = (data.get("subject") or "").strip()
+    if not subject:
+        problems.append(
+            "`subject` is missing — the sibling cards are phrased around it "
+            "('When is ___ the wrong answer?')."
+        )
+    else:
+        _check_budget(problems, "subject", "subject", subject)
 
     scenario = (data.get("scenario") or "").strip()
     if _word_count(scenario) < 12:
@@ -556,6 +572,7 @@ def render_card(data: dict[str, Any], note: RawNote | None = None, today: date |
 
     meta: dict[str, Any] = {
         "id": card_id,
+        "cluster": card_id,
         "topic": topic,
         "created": today.isoformat(),
         "next_review": today.isoformat(),  # new cards are due immediately
@@ -563,6 +580,10 @@ def render_card(data: dict[str, Any], note: RawNote | None = None, today: date |
         "ease_factor": 2.5,
         "repetition_count": 0,
     }
+    subject = (data.get("subject") or "").strip()
+    if subject:
+        meta["subject"] = subject
+
     if note:
         # Lets `--sync` recognise this note next run even though the LLM
         # rewrote the question (and therefore the id).
@@ -586,6 +607,18 @@ def render_card(data: dict[str, Any], note: RawNote | None = None, today: date |
     # it — that is what makes hand-edit detection reliable.
     card.meta["body_hash"] = card.body_digest()
     return card
+
+
+def render_cards(
+    data: dict[str, Any], note: RawNote | None = None, today: date | None = None
+) -> list[Card]:
+    """Render one model response into the cluster of cards it describes.
+
+    The four sections are four questions about one mechanism, forgotten at four
+    different rates, so they are written as siblings with their own SM-2 state
+    rather than as one card with a single ease factor.
+    """
+    return split_card(render_card(data, note=note, today=today), today=today)
 
 
 def _as_if(condition: str) -> str:
@@ -647,8 +680,8 @@ class Synthesizer:
                 time.sleep(delay)
         raise SynthesisError(f"{self.provider.name} synthesis failed: {last_exc}") from last_exc
 
-    def synthesize(self, note: RawNote) -> Card:
-        """Convert one raw note into a linted `Card`.
+    def synthesize(self, note: RawNote) -> list[Card]:
+        """Convert one raw note into the cluster of linted cards it describes.
 
         Raises `SynthesisError` if the provider is unreachable or its output is
         unparseable. A card that merely fails the *quality* lint after one
@@ -689,4 +722,4 @@ class Synthesizer:
                 data.get("id") or note.suggested_id, len(problems), problems[0],
             )
 
-        return render_card(data, note=note)
+        return render_cards(data, note=note)

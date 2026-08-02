@@ -10,11 +10,21 @@ from src.synthesizer import (
     extract_json,
     lint_card,
     render_card,
+    render_cards,
 )
+from src.vault import KIND_DECISION, KIND_MECHANISM, KIND_MODIFIER, KIND_TIPPING
+
+
+def _of_kind(cards, kind):
+    """The single sibling of `kind` — modifiers are matched by their label."""
+    matches = [c for c in cards if c.kind == kind]
+    assert matches, f"no {kind} card in {[c.id for c in cards]}"
+    return matches[0]
 
 GOOD_CARD = {
     "id": "kafka-retry-patterns",
     "topic": "Distributed Systems",
+    "subject": "Kafka retry topics",
     "scenario": (
         "Your `orders` consumer lag alert fires at 03:00. One malformed record has been "
         "failing for twenty minutes and 40k messages are stacked behind it on partition 3."
@@ -232,6 +242,105 @@ def test_render_records_the_notion_source_url():
     assert render_card(GOOD_CARD, note=note).meta["source_url"] == "https://notion.so/abc"
 
 
+# --- splitting one note into sibling cards --------------------------------
+#
+# Four sections are four questions about one mechanism, forgotten at four
+# different rates. Under one ease factor, rating Good because the mechanism came
+# back also pushes the matrix rows you fumbled out to thirty days.
+
+
+def test_one_note_becomes_one_card_per_question_it_asks():
+    cards = render_cards(GOOD_CARD)
+    assert [c.kind for c in cards] == [
+        KIND_MECHANISM, KIND_DECISION, KIND_TIPPING, KIND_MODIFIER, KIND_MODIFIER
+    ]
+    assert [c.id for c in cards] == [
+        "kafka-retry-patterns-mech",
+        "kafka-retry-patterns-dec",
+        "kafka-retry-patterns-tip",
+        "kafka-retry-patterns-mod1",
+        "kafka-retry-patterns-mod2",
+    ]
+    assert {c.cluster for c in cards} == {"kafka-retry-patterns"}
+
+
+def test_each_sibling_carries_only_its_own_section():
+    cards = {c.kind: c for c in render_cards(GOOD_CARD)}
+
+    assert "Decision Matrix" not in cards[KIND_MECHANISM].sections
+    assert "Direct Mechanism" not in cards[KIND_TIPPING].sections
+    assert cards[KIND_DECISION].sections.keys() == {"Scenario", "Decision Matrix"}
+
+
+def test_every_sibling_keeps_the_scenario_so_it_stands_alone():
+    for card in render_cards(GOOD_CARD):
+        assert "lag alert fires at 03:00" in card.scenario
+
+
+def test_the_decision_matrix_is_not_split_row_by_row():
+    """Its rows are only meaningful against each other."""
+    decision = _of_kind(render_cards(GOOD_CARD), KIND_DECISION)
+    assert len(decision.decision_matrix) == 2
+
+
+def test_sibling_questions_are_phrased_around_the_subject():
+    cards = {c.kind: c for c in render_cards(GOOD_CARD)}
+
+    assert cards[KIND_MECHANISM].question == GOOD_CARD["question"]
+    assert cards[KIND_TIPPING].question == (
+        "When is Kafka retry topics the wrong answer, and what wins instead?"
+    )
+    assert "Kafka retry topics" in cards[KIND_DECISION].question
+
+
+def test_a_modifier_sibling_is_asked_by_name():
+    modifier = render_cards(GOOD_CARD)[3]
+    assert modifier.question.startswith("Strict Ordering now holds.")
+    # The "Modifier 1 (...)" label is redundant once it is the question.
+    assert "Modifier 1" not in modifier.sections["Constraint Modifiers"]
+
+
+def test_siblings_without_a_subject_fall_back_to_the_parent_question():
+    cards = {c.kind: c for c in render_cards({k: v for k, v in GOOD_CARD.items()
+                                              if k != "subject"})}
+    tipping = cards[KIND_TIPPING].question
+    assert tipping.startswith("How do you retry a failed Kafka message")
+    assert tipping.endswith("when is this the wrong approach, and what wins instead?")
+
+
+def test_each_sibling_is_scheduled_independently():
+    for card in render_cards(GOOD_CARD):
+        assert card.meta["repetition_count"] == 0
+        assert card.meta["next_review"] == card.meta["created"]
+        assert card.meta["body_hash"] == card.body_digest()
+
+
+def test_siblings_keep_the_provenance_that_matches_them_to_the_note():
+    note = RawNote(question="q", raw_answer="a" * 60, block_id="blk-1")
+    for card in render_cards(GOOD_CARD, note=note):
+        assert card.meta["source_block_id"] == "blk-1"
+        assert card.meta["source_hash"] == note.content_hash
+
+
+def test_sibling_ids_still_fit_in_telegram_callback_data():
+    from src.telegram_bot import MAX_CALLBACK_BYTES, STAGE_RATE, Callback
+
+    data = dict(GOOD_CARD, id="a" * 60)
+    for card in render_cards(data):
+        encoded = Callback(STAGE_RATE, card.id, 5).encode()
+        assert len(encoded.encode()) <= MAX_CALLBACK_BYTES
+        # ...without the id being silently truncated to something unfindable.
+        assert Callback.decode(encoded).card_id == card.id
+
+
+def test_a_card_with_nothing_to_split_is_left_alone():
+    thin = {k: v for k, v in GOOD_CARD.items()
+            if k not in ("decision_matrix", "tipping_point", "constraint_modifiers")}
+    cards = render_cards(thin)
+    assert len(cards) == 1
+    assert cards[0].id == "kafka-retry-patterns"
+
+
 # --- orchestration --------------------------------------------------------
 
 
@@ -257,9 +366,9 @@ def note():
 def test_a_clean_first_draft_needs_no_retry(note, monkeypatch):
     monkeypatch.setattr("src.synthesizer.MIN_SECONDS_BETWEEN_CALLS", 0)
     provider = FakeProvider(json.dumps(GOOD_CARD))
-    card = Synthesizer(Config(), provider=provider).synthesize(note)
+    cards = Synthesizer(Config(), provider=provider).synthesize(note)
     assert len(provider.calls) == 1
-    assert card.id == "kafka-retry-patterns"
+    assert {c.cluster for c in cards} == {"kafka-retry-patterns"}
 
 
 def test_a_buzzword_draft_triggers_one_corrective_retry(note, monkeypatch):
@@ -267,11 +376,11 @@ def test_a_buzzword_draft_triggers_one_corrective_retry(note, monkeypatch):
     bad = dict(GOOD_CARD, tipping_point="Wrong if you need it to be more scalable and robust.")
     provider = FakeProvider(json.dumps(bad), json.dumps(GOOD_CARD))
 
-    card = Synthesizer(Config(), provider=provider).synthesize(note)
+    cards = Synthesizer(Config(), provider=provider).synthesize(note)
 
     assert len(provider.calls) == 2
     assert "rejected by the quality linter" in provider.calls[1][1]
-    assert "RabbitMQ" in card.tipping_point
+    assert "RabbitMQ" in _of_kind(cards, KIND_TIPPING).tipping_point
 
 
 def test_the_first_draft_is_kept_when_the_rewrite_is_no_better(note, monkeypatch):
@@ -280,8 +389,8 @@ def test_the_first_draft_is_kept_when_the_rewrite_is_no_better(note, monkeypatch
     worse = dict(bad, direct_mechanism="Nope.")
     provider = FakeProvider(json.dumps(bad), json.dumps(worse))
 
-    card = Synthesizer(Config(), provider=provider).synthesize(note)
-    assert "Nope." not in card.direct_mechanism
+    cards = Synthesizer(Config(), provider=provider).synthesize(note)
+    assert "Nope." not in _of_kind(cards, KIND_MECHANISM).direct_mechanism
 
 
 GEMINI_DAILY_429 = (
@@ -364,9 +473,9 @@ def test_a_per_minute_limit_is_still_retried(note, monkeypatch):
                 raise RuntimeError(GEMINI_PER_MINUTE_429)
             return json.dumps(GOOD_CARD)
 
-    card = Synthesizer(Config(), provider=Flaky()).synthesize(note)
+    cards = Synthesizer(Config(), provider=Flaky()).synthesize(note)
     assert len(calls) == 2
-    assert card.id == "kafka-retry-patterns"
+    assert {c.cluster for c in cards} == {"kafka-retry-patterns"}
 
 
 def test_provider_failure_surfaces_as_synthesis_error(note, monkeypatch):
