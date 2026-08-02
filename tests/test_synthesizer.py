@@ -15,13 +15,16 @@ from src.synthesizer import (
 GOOD_CARD = {
     "id": "kafka-retry-patterns",
     "topic": "Distributed Systems",
+    "scenario": (
+        "Your `orders` consumer lag alert fires at 03:00. One malformed record has been "
+        "failing for twenty minutes and 40k messages are stacked behind it on partition 3."
+    ),
     "question": "How do you retry a failed Kafka message without blocking the partition?",
     "direct_mechanism": (
         "A consumer tracks one monotonic offset per partition, so retrying in place stalls "
         "everything behind it. Produce the payload to `orders-retry-30s` with a retry-count "
-        "header and commit the original offset immediately. A second group enforces the delay "
-        "by comparing the record timestamp against now and calling `pause()` until it matures. "
-        "After max.retries the record lands in `orders-dlq`."
+        "header and commit the original offset. A delay consumer calls `pause()` until the "
+        "record matures, then `orders-dlq` takes it after max.retries."
     ),
     "decision_matrix": [
         {"condition": "partition progress must not stall",
@@ -32,15 +35,17 @@ GOOD_CARD = {
          "tradeoff": "throughput for that partition is 0 until it succeeds"},
     ],
     "tipping_point": (
-        "Wrong when retry policy must be per-message: delay is encoded by topic, so every "
-        "schedule costs a topic. Use RabbitMQ per-message TTL with a dead-letter exchange."
+        "Wrong when retry delay must vary per message: the delay is encoded by topic, so "
+        "every schedule costs a topic. Use RabbitMQ per-message TTL with a dead-letter exchange."
     ),
     "constraint_modifiers": [
-        {"name": "Strict Ordering", "effect": "Retry topics violate the per-key guarantee; "
-                                              "pause the partition and add a poison timeout."},
-        {"name": "Exactly-Once", "effect": "The produce and the offset commit must share a "
+        {"name": "Strict Ordering", "effect": "Retry topics break the per-key guarantee; "
+                                              "pause the partition and add a poison-pill "
+                                              "timeout instead."},
+        {"name": "Exactly-Once", "effect": "The produce and the offset commit must share one "
                                            "transaction via `sendOffsetsToTransaction()`."},
     ],
+    "anchor": "Kafka Streams ships this as its `DeserializationExceptionHandler` dead-letter path.",
 }
 
 
@@ -63,8 +68,7 @@ def test_buzzword_is_allowed_when_the_sentence_explains_the_mechanism():
         direct_mechanism=(
             "The read path is fast because `sendfile(2)` moves bytes from the page cache "
             "straight into the socket buffer with no user-space copy. Enabling TLS defeats "
-            "this and costs roughly 30% throughput. Offsets stay monotonic per partition. "
-            "The broker never parses the record body on this path."
+            "this and costs roughly 30% throughput. Offsets stay monotonic per partition."
         ),
     )
     assert not any("buzzword" in p for p in lint_card(card))
@@ -98,6 +102,56 @@ def test_structural_sections_must_have_at_least_two_entries(key):
 def test_incomplete_matrix_row_is_reported():
     row = [dict(GOOD_CARD["decision_matrix"][0], tradeoff=""), GOOD_CARD["decision_matrix"][1]]
     assert any("tradeoff" in p for p in lint_card(dict(GOOD_CARD, decision_matrix=row)))
+
+
+# --- word budgets ---------------------------------------------------------
+#
+# The linter used to enforce only minimums, so the model faced one-sided length
+# pressure and inflated: the first 90 cards averaged 424 words of body prose.
+# At that size a review is re-reading, and ~8 separately-forgettable claims sit
+# under one SM-2 ease factor.
+
+
+def test_an_overlong_mechanism_is_rejected():
+    bloated = GOOD_CARD["direct_mechanism"] + " " + " ".join(f"word{i}" for i in range(40))
+    problems = lint_card(dict(GOOD_CARD, direct_mechanism=bloated))
+    assert any("60-word budget" in p for p in problems)
+
+
+def test_the_budget_complaint_says_to_delete_not_paraphrase():
+    problems = lint_card(dict(GOOD_CARD, tipping_point=GOOD_CARD["tipping_point"] * 3))
+    assert any("do not paraphrase" in p for p in problems)
+
+
+@pytest.mark.parametrize("field,limit", [("condition", 12), ("choice", 15), ("tradeoff", 20)])
+def test_each_matrix_cell_has_its_own_budget(field, limit):
+    row = dict(GOOD_CARD["decision_matrix"][0], **{field: "word " * (limit + 1)})
+    problems = lint_card(dict(GOOD_CARD, decision_matrix=[row, GOOD_CARD["decision_matrix"][1]]))
+    assert any(f"decision_matrix[1].{field}" in p for p in problems)
+
+
+def test_a_mechanism_running_past_three_sentences_is_rejected():
+    four = "It uses `a`. Then it uses `b`. Then `c` happens. Finally `d` is written."
+    assert any("3 sentences" in p for p in lint_card(dict(GOOD_CARD, direct_mechanism=four)))
+
+
+def test_a_card_without_a_scenario_is_rejected():
+    """A concrete situation is a retrieval cue and a transfer test, not decoration."""
+    problems = lint_card({k: v for k, v in GOOD_CARD.items() if k != "scenario"})
+    assert any("`scenario`" in p for p in problems)
+
+
+def test_a_generic_scenario_is_too_thin_to_pass():
+    problems = lint_card(dict(GOOD_CARD, scenario="Consider a Kafka consumer."))
+    assert any("`scenario`" in p for p in problems)
+
+
+def test_nominalised_phrasing_is_rejected():
+    card = dict(GOOD_CARD, tipping_point=(
+        "Wrong when offset compaction is performed on every poll: the broker rewrites "
+        "the segment. Use a log-compacted topic with `min.cleanable.dirty.ratio` instead."
+    ))
+    assert any("Nominalised" in p for p in lint_card(card))
 
 
 # --- JSON extraction ------------------------------------------------------
@@ -155,6 +209,22 @@ def card_matrix_text(card):
 def test_render_survives_a_missing_id():
     card = render_card({k: v for k, v in GOOD_CARD.items() if k != "id"})
     assert card.id  # derived from the question
+
+
+def test_render_puts_the_scenario_and_anchor_on_the_card():
+    card = render_card(GOOD_CARD)
+    assert "lag alert fires at 03:00" in card.scenario
+    assert "DeserializationExceptionHandler" in card.anchor
+
+
+def test_empty_sections_are_dropped_so_the_body_hash_survives_a_round_trip():
+    """A blank section is omitted by `to_markdown`, so storing one would make
+    every card read back off disk look hand-edited."""
+    from src.vault import Card
+
+    card = render_card({k: v for k, v in GOOD_CARD.items() if k != "anchor"})
+    assert "Seen In" not in card.sections
+    assert Card.from_markdown(card.to_markdown()).body_digest() == card.meta["body_hash"]
 
 
 def test_render_records_the_notion_source_url():

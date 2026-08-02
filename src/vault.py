@@ -30,17 +30,24 @@ log = logging.getLogger(__name__)
 
 FRONTMATTER_DELIM = "---"
 
+#: Read *before* answering: the concrete situation that makes this knowledge
+#: the thing you need. Belongs to the question side of the card, not the answer.
+SECTION_SCENARIO = "Scenario"
 SECTION_MECHANISM = "Direct Mechanism"
 SECTION_MATRIX = "Decision Matrix"
 SECTION_TIPPING_POINT = "Tipping Point (When is this WRONG?)"
 SECTION_MODIFIERS = "Constraint Modifiers"
+#: One real system where this shows up — somewhere for the idea to live.
+SECTION_ANCHOR = "Seen In"
 
 #: Canonical section order when writing a card.
 SECTION_ORDER = (
+    SECTION_SCENARIO,
     SECTION_MECHANISM,
     SECTION_MATRIX,
     SECTION_TIPPING_POINT,
     SECTION_MODIFIERS,
+    SECTION_ANCHOR,
 )
 
 #: Frontmatter key order — matches the documented schema.
@@ -199,6 +206,14 @@ class Card:
     # -- Content accessors used by the Telegram flow ----------------------
 
     @property
+    def scenario(self) -> str:
+        return self.sections.get(SECTION_SCENARIO, "").strip()
+
+    @property
+    def anchor(self) -> str:
+        return self.sections.get(SECTION_ANCHOR, "").strip()
+
+    @property
     def direct_mechanism(self) -> str:
         return self.sections.get(SECTION_MECHANISM, "").strip()
 
@@ -214,12 +229,27 @@ class Card:
     def constraint_modifiers(self) -> list[str]:
         return _bullets(self.sections.get(SECTION_MODIFIERS, ""))
 
-    def key_checkpoints(self) -> str:
-        """A partial reveal: the mechanics, plus decision-matrix *conditions*
-        with their answers redacted, so recall is still being tested."""
+    def retrieval_cues(self) -> str:
+        """A hint that *provokes* recall instead of replacing it.
+
+        This stage used to print `direct_mechanism` verbatim, which made the
+        "partial reveal" the full answer and turned the session into re-reading
+        — the recognition trap the whole project exists to avoid. What comes
+        back now is the skeleton: the identifiers, syscalls and magnitudes the
+        answer is built from, plus the decision-matrix *conditions* with their
+        choices still redacted. Enough to unstick a stalled retrieval, not
+        enough to substitute for one.
+        """
         parts: list[str] = []
-        if self.direct_mechanism:
-            parts.append(self.direct_mechanism)
+
+        tokens = _cue_tokens(self.direct_mechanism)
+        if tokens:
+            parts.append("  ·  ".join(tokens))
+        elif self.direct_mechanism:
+            # Nothing quotable in the mechanism — fall back to an opening-words
+            # cue, which is still a cue rather than the answer.
+            opening = " ".join(self.direct_mechanism.split()[:8])
+            parts.append(f"{opening} …")
 
         conditions = [cond for cond in (_condition_of(b) for b in self.decision_matrix) if cond]
         if conditions:
@@ -272,6 +302,36 @@ def _bullets(section: str) -> list[str]:
         match = _BULLET.match(line)
         if match and not line.startswith(("  ", "\t")):
             out.append(match.group(1).strip())
+    return out
+
+
+#: The quotable skeleton of an answer: `identifiers`, calls like `sendfile(2)`
+#: or `O(n log n)`, and magnitudes with units. These are exactly the things a
+#: stalled retrieval needs handed back, and exactly the things that are useless
+#: to someone who has not done the retrieval.
+_CUE_TOKEN = re.compile(
+    r"`[^`\n]+`"
+    r"|\b[A-Za-z_]\w*\([^)\s]{0,16}\)"
+    r"|\b\d+(?:\.\d+)?\s?(?:ms|µs|us|ns|KB|MB|GB|TB|kB|%)\b"
+)
+
+#: Beyond this the cue stops being a cue and starts being the answer.
+MAX_CUE_TOKENS = 6
+
+
+def _cue_tokens(text: str, limit: int = MAX_CUE_TOKENS) -> list[str]:
+    """Distinct cue tokens in `text`, in the order they appear."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _CUE_TOKEN.finditer(text or ""):
+        token = match.group(0).strip()
+        key = token.strip("`").casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(token if token.startswith("`") else f"`{token}`")
+        if len(out) >= limit:
+            break
     return out
 
 
@@ -485,10 +545,36 @@ class Vault:
                     index.setdefault(str(key), card)
         return index
 
-    def due_cards(self, today: date | None = None, limit: int | None = None) -> list[Card]:
-        """Cards with `next_review <= today`, most overdue first."""
+    def due_cards(
+        self,
+        today: date | None = None,
+        limit: int | None = None,
+        new_limit: int | None = None,
+    ) -> list[Card]:
+        """Cards with `next_review <= today`, most overdue first.
+
+        `new_limit` caps how many of them may be cards you have never rated.
+        A first pass costs minutes and a repeat costs seconds, so a queue
+        measured only in cards is not measured in effort: 20 reviews is a
+        comfortable session and 20 new cards is an abandoned one. Reviews are
+        never displaced by the cap — the overflow of new cards is what waits,
+        and since they are already overdue they stay at the head of tomorrow's
+        queue.
+        """
         due = [card for card in self.load_all() if card.is_due(today)]
         due.sort(key=lambda c: (c.review_state.next_review or date.min, c.id))
+
+        if new_limit is not None:
+            kept: list[Card] = []
+            new_seen = 0
+            for card in due:
+                if card.review_state.repetition_count == 0:
+                    if new_seen >= new_limit:
+                        continue
+                    new_seen += 1
+                kept.append(card)
+            due = kept
+
         return due[:limit] if limit else due
 
     def topic_cards(

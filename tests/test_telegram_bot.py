@@ -28,6 +28,10 @@ def card():
         topic="Distributed Systems",
         question="How do you retry a failed Kafka message without blocking the partition?",
         sections={
+            "Scenario": (
+                "Your `orders` lag alert fires at 03:00 — one malformed record has "
+                "stalled partition 3 for twenty minutes."
+            ),
             "Direct Mechanism": "Publish to a retry topic and commit via `commitSync()`.",
             "Decision Matrix": (
                 "- **IF throughput is the priority:** route to `orders-retry-1` — *trade-off:* reordering.\n"
@@ -38,6 +42,7 @@ def card():
                 "- *Modifier 1 (Strict Ordering):* Pause the partition.\n"
                 "- *Modifier 2 (Cost Limits):* Bounded in-memory buffer."
             ),
+            "Seen In": "Kafka Streams ships this as `DeserializationExceptionHandler`.",
         },
         meta={"interval": 6, "ease_factor": 2.5, "repetition_count": 2},
     )
@@ -92,22 +97,33 @@ def test_angle_brackets_inside_code_are_escaped():
 # --- stage rendering ------------------------------------------------------
 
 
-def test_stage_one_shows_only_the_question(card):
+def test_stage_one_shows_the_scenario_and_the_question_only(card):
     text, keyboard = render_stage_question(card)
     assert "How do you retry" in text
+    # The scenario is part of the *question* — it has to be read while the
+    # answer is still unknown, or it tests nothing.
+    assert "lag alert fires at 03:00" in text
     assert "commitSync" not in text
     assert keyboard.inline_keyboard[0][0].callback_data == Callback(STAGE_REVEAL, card.id).encode()
 
 
-def test_stage_two_reveals_mechanism_but_hides_the_choices(card):
+def test_stage_two_cues_the_answer_without_printing_it(card):
     text, keyboard = render_stage_checkpoints(card)
-    assert "commitSync()" in text
+    assert "commitSync()" in text                     # the identifier comes back
+    assert "Publish to a retry topic" not in text     # the mechanism prose does not
     assert "IF strict ordering is required" in text
     assert "pause()" not in text
 
     labels = [b.text for b in keyboard.inline_keyboard[0]]
     assert any("Shift Constraint" in label for label in labels)
     assert any("Show Full Answer" in label for label in labels)
+
+
+def test_the_rated_confirmation_does_not_repeat_the_scenario(card):
+    from src.telegram_bot import render_rated
+    from src.sm2 import QUALITY_GOOD
+
+    assert "lag alert fires" not in render_rated(card, QUALITY_GOOD)
 
 
 def test_shift_constraint_shows_one_modifier_and_advances_the_index(card):

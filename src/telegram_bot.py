@@ -2,13 +2,17 @@
 
 The flow deliberately makes you commit before you see anything:
 
-    ┌ Q: <question>                       [👁️ Reveal Key Checkpoints]
+    ┌ scenario + Q: <question>            [🗝 Cue Me]
     │
-    ├ + mechanism, matrix conditions      [⚡ Shift Constraint] [📖 Show Full Answer]
+    ├ + cue tokens, matrix conditions     [⚡ Shift Constraint] [📖 Show Full Answer]
     │   redacted                          (shift injects a constraint modifier)
     │
     └ + full card                         [🔴 Hard] [🟡 Good] [🟢 Easy]
                                           -> SM-2 update -> commit to git
+
+Stage two hands back the *skeleton* of the answer — the identifiers, syscalls
+and magnitudes — rather than the mechanism paragraph itself. A hint that can be
+read instead of recalled is not a hint.
 
 Every stage re-renders from the card file, and `callback_data` carries the
 card id, so the flow survives a bot restart: `--notify` can push cards from a
@@ -149,11 +153,18 @@ def resolve_topic_request(request: str, available: set[str]) -> str | None:
     return canonical if canonical in available else None
 
 
-def _header(card: Card) -> str:
-    return (
-        f"🧠 <b>{html.escape(card.topic)}</b>\n\n"
-        f"<b>Q: {html.escape(card.question)}</b>"
-    )
+def _header(card: Card, with_scenario: bool = True) -> str:
+    """Topic, the scenario that sets the problem up, then the question.
+
+    The scenario comes *before* the question deliberately: a concrete situation
+    is a retrieval cue and a transfer test, and it only works if it is read
+    while the answer is still unknown.
+    """
+    parts = [f"🧠 <b>{html.escape(card.topic)}</b>", ""]
+    if card.scenario and with_scenario:
+        parts += [f"<i>{md_to_html(card.scenario)}</i>", ""]
+    parts.append(f"<b>Q: {html.escape(card.question)}</b>")
+    return "\n".join(parts)
 
 
 def render_stage_question(card: Card) -> tuple[str, InlineKeyboardMarkup]:
@@ -165,7 +176,7 @@ def render_stage_question(card: Card) -> tuple[str, InlineKeyboardMarkup]:
     text = f"{_header(card)}\n\n<i>Answer it out loud first.</i>\n<code>{footprint}</code>"
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton(
-            "👁️ Reveal Key Checkpoints",
+            "🗝 Cue Me",
             callback_data=Callback(STAGE_REVEAL, card.id).encode(),
         )]]
     )
@@ -173,7 +184,11 @@ def render_stage_question(card: Card) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def render_stage_checkpoints(card: Card, modifier_index: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
-    parts = [_header(card), "", "🔑 <b>Key Checkpoints</b>", md_to_html(card.key_checkpoints())]
+    parts = [
+        _header(card), "",
+        "🗝 <b>Cue</b> <i>(the pieces the answer is built from — keep going)</i>",
+        md_to_html(card.retrieval_cues()),
+    ]
 
     modifiers = card.constraint_modifiers
     next_index = 0
@@ -205,6 +220,7 @@ def render_stage_full(card: Card) -> tuple[str, InlineKeyboardMarkup]:
         ("🧭 Decision Matrix", card.sections.get(SECTION_MATRIX, "")),
         ("🚫 Tipping Point (when this is WRONG)", card.tipping_point),
         ("🔀 Constraint Modifiers", card.sections.get(SECTION_MODIFIERS, "")),
+        ("📍 Seen In", card.anchor),
     ):
         if content.strip():
             body += [f"<b>{title}</b>", md_to_html(content.strip()), ""]
@@ -223,7 +239,7 @@ def render_stage_full(card: Card) -> tuple[str, InlineKeyboardMarkup]:
 def render_rated(card: Card, quality: int) -> str:
     state = card.review_state
     return (
-        f"{_header(card)}\n\n"
+        f"{_header(card, with_scenario=False)}\n\n"
         f"✅ Rated <b>{QUALITY_LABELS.get(quality, quality)}</b>\n"
         f"Next review: <b>{state.next_review}</b> "
         f"(+{humanise_interval(state.interval)})\n"
@@ -433,7 +449,9 @@ class DeepRecallBot:
         due = (
             self.vault.topic_cards(topic, limit=limit)
             if topic
-            else self.vault.due_cards(limit=limit)
+            else self.vault.due_cards(
+                limit=limit, new_limit=self.config.max_new_cards_per_session
+            )
         )
         if not due:
             log.info("No cards to send%s.", f" for topic {topic!r}" if topic else " today")

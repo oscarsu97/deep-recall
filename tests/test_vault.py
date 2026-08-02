@@ -113,11 +113,93 @@ def test_future_cards_are_not_due(vault):
     assert vault.due_cards(today=date(2026, 7, 29)) == []
 
 
-def test_key_checkpoints_redact_the_matrix_choices(vault):
-    checkpoints = vault.find("kafka-retry-patterns").key_checkpoints()
-    assert "commitSync()" in checkpoints
-    assert "IF strict ordering is required" in checkpoints
-    assert "pause()" not in checkpoints  # the answer stays hidden
+def test_retrieval_cues_redact_the_matrix_choices(vault):
+    cues = vault.find("kafka-retry-patterns").retrieval_cues()
+    assert "commitSync()" in cues
+    assert "IF strict ordering is required" in cues
+    assert "pause()" not in cues  # the answer stays hidden
+
+
+def test_retrieval_cues_hint_rather_than_reprint_the_mechanism(vault):
+    """The cue is the skeleton of the answer, not the answer.
+
+    Printing `direct_mechanism` verbatim here would make stage two the full
+    reveal and turn the review into re-reading.
+    """
+    card = vault.find("kafka-retry-patterns")
+    cues = card.retrieval_cues()
+
+    assert "`commitSync()`" in cues          # the identifier comes back
+    assert "Publish to a retry topic" not in cues   # the prose does not
+    assert card.direct_mechanism not in cues
+
+
+def test_retrieval_cues_fall_back_to_opening_words_without_identifiers():
+    card = Card(
+        id="x", topic="Databases", question="Why?",
+        sections={"Direct Mechanism": "The planner walks the join tree and picks an order."},
+    )
+    cues = card.retrieval_cues()
+    assert cues.startswith("The planner walks the join tree and")
+    assert cues.endswith("…")
+    assert "picks an order" not in cues
+
+
+def test_retrieval_cues_are_capped(vault):
+    card = Card(
+        id="x", topic="Databases", question="Why?",
+        sections={"Direct Mechanism": " ".join(f"`ident{i}`" for i in range(20))},
+    )
+    assert card.retrieval_cues().count("`ident") == 6
+
+
+def _due_card(vault, card_id, next_review, repetition_count):
+    vault.save(
+        Card(
+            id=card_id,
+            topic="Databases",
+            question=f"Question {card_id}?",
+            sections={"Direct Mechanism": "x"},
+            meta={
+                "id": card_id, "topic": "Databases",
+                "next_review": next_review.isoformat(),
+                "repetition_count": repetition_count,
+            },
+        )
+    )
+
+
+def test_new_limit_caps_first_passes_without_displacing_reviews(vault):
+    """A first pass costs minutes; a repeat costs seconds.
+
+    A queue capped only in cards is not capped in effort, so the new-card
+    budget is separate — and spending it never pushes out a due review.
+    """
+    for i in range(6):
+        _due_card(vault, f"new-{i}", date(2026, 1, 1), repetition_count=0)
+    for i in range(4):
+        _due_card(vault, f"rep-{i}", date(2026, 1, 2), repetition_count=3)
+
+    due = vault.due_cards(today=date(2026, 7, 29), new_limit=2)
+    ids = [c.id for c in due]
+
+    assert sum(1 for i in ids if i.startswith("new-")) == 2
+    assert sum(1 for i in ids if i.startswith("rep-")) == 4
+
+
+def test_new_limit_keeps_the_most_overdue_new_cards(vault):
+    _due_card(vault, "new-old", date(2026, 1, 1), repetition_count=0)
+    _due_card(vault, "new-recent", date(2026, 7, 1), repetition_count=0)
+
+    due = vault.due_cards(today=date(2026, 7, 29), new_limit=1)
+    assert [c.id for c in due] == ["new-old"]
+
+
+def test_due_cards_without_a_new_limit_are_unfiltered(vault):
+    for i in range(3):
+        _due_card(vault, f"new-{i}", date(2026, 1, 1), repetition_count=0)
+    # The fixture card is scheduled for the 30th, so only the three new ones.
+    assert len(vault.due_cards(today=date(2026, 7, 29))) == 3
 
 
 def test_unparseable_cards_are_skipped_not_fatal(vault, caplog):

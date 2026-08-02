@@ -12,10 +12,29 @@ every card into a shape that has to be earned:
 
 | Section                  | What it forces out of you                                       |
 | ------------------------ | --------------------------------------------------------------- |
+| **Scenario**             | The concrete moment where you'd need this — read *before* answering |
 | **Direct Mechanism**     | The 30-second answer in syscalls, data structures and parameters |
 | **Decision Matrix**      | `IF <constraint> THEN <choice> BECAUSE <trade-off>`              |
 | **Tipping Point**        | When is this technology the **wrong** answer, and what wins?     |
-| **Constraint Modifiers** | 2–3 changes that invalidate the architecture you just described  |
+| **Constraint Modifiers** | 2 changes that invalidate the architecture you just described    |
+| **Seen In**              | One real system the idea lives in, so it has somewhere to attach |
+
+### Why the cards are short
+
+Every field carries a **word budget the linter enforces** (60 words for the
+mechanism, 20 for a trade-off, 40 for the tipping point). This is not a style
+preference. The first 90 cards averaged **424 words of body prose**, and a card
+that size fails twice over: it is read rather than recalled, and it buries ~8
+separately-forgettable claims under a single SM-2 ease factor — so rating
+"Good" because you nailed the mechanism pushes the two matrix rows you fumbled
+out to 30 days as well.
+
+The linter is therefore two-sided: a floor (say something real — name a
+syscall, a parameter, a magnitude) *and* a ceiling (say it in one breath).
+
+The **Scenario** is deliberately on the question side. An example appended to
+an answer makes the card longer and still tests recitation; a concrete
+situation used as the prompt makes the card shorter and tests transfer.
 
 ---
 
@@ -70,7 +89,7 @@ flowchart TB
                                                        # Q: …
                                     ┌──────────────────────┘
                                     ▼
-   Telegram  ──►  [👁️ Reveal]  ──►  [⚡ Shift]  ──►  [📖 Full]  ──►  [🔴🟡🟢]
+   Telegram  ──►  [🗝 Cue Me]  ──►  [⚡ Shift]  ──►  [📖 Full]  ──►  [🔴🟡🟢]
                                                                        │
                         SM-2 recomputes interval / ease / next_review  │
                         rewrites the frontmatter, git commit + push  ◄──┘
@@ -85,15 +104,17 @@ a later `--bot-poll` session picks up the button press.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Question: --notify pushes due cards
-    Question --> Checkpoints: 👁️ Reveal Key Checkpoints
-    note right of Checkpoints
-        Shows the mechanism +
-        decision-matrix conditions
-        with the choices redacted
+    [*] --> Question: --notify pushes scenario + question
+    Question --> Cue: 🗝 Cue Me
+    note right of Cue
+        The skeleton only:
+        `identifiers`, syscalls,
+        magnitudes — plus matrix
+        conditions with the
+        choices redacted
     end note
-    Checkpoints --> Checkpoints: ⚡ Shift Constraint (cycles modifiers)
-    Checkpoints --> FullAnswer: 📖 Show Full Answer
+    Cue --> Cue: ⚡ Shift Constraint (cycles modifiers)
+    Cue --> FullAnswer: 📖 Show Full Answer
     FullAnswer --> Rated: 🔴 Hard / 🟡 Good / 🟢 Easy
     Rated --> [*]: SM-2 → frontmatter → git
 ```
@@ -374,6 +395,10 @@ source_url: "https://notion.so/…"
 # Q: If processing of one message fails in Kafka, how do you retry without
      blocking partition consumption?
 
+## Scenario
+Your `orders` lag alert fires at 03:00. One malformed record has been failing
+for twenty minutes and 40k messages are stacked behind it on partition 3.
+
 ## Direct Mechanism
 A consumer tracks one monotonic `offset` per partition, so retrying in place
 stalls everything behind it…
@@ -393,6 +418,9 @@ TTL + DLX, or Postgres with `SELECT … FOR UPDATE SKIP LOCKED`.
 - *Modifier 1 (Strict Ordering):* Retry topics become unusable…
 - *Modifier 2 (Exactly-Once):* The produce and the offset commit must share a
   transaction via `sendOffsetsToTransaction()`…
+
+## Seen In
+Kafka Streams ships this as its `DeserializationExceptionHandler` dead-letter path.
 ```
 
 Parsing is **structure-preserving**: frontmatter keys you add and `##` sections
