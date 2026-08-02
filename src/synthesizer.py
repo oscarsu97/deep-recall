@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Protocol
 
+from . import topics
 from .config import Config
 from .ingestion import RawNote
 from .vault import (
@@ -124,8 +125,9 @@ fences. Schema:
 
 {
   "id": "kebab-case-slug, max 48 chars, derived from the question",
-  "topic": "Broad field, Title Case. e.g. 'Distributed Systems', 'Databases', \
-'Operating Systems', 'Networking', 'Concurrency'",
+  "topic": "Pick the single best fit from this list, copied verbatim: \
+__TOPIC_LIST__. Do not invent a new topic or a narrower variant of one of \
+these — the topic is a folder name, and new labels fragment the collection.",
   "question": "One sharp question that forces the mechanism out. Rewrite the \
 source question if it is vague. No yes/no questions.",
   "direct_mechanism": "The 30-second answer. 2-5 sentences of pure mechanics: \
@@ -152,7 +154,7 @@ why — the second-order consequence, not a restatement."
 
 Provide 2-4 decision_matrix entries and 2-3 constraint_modifiers. Each \
 constraint modifier must change the *architecture*, not merely the tuning.\
-"""
+""".replace("__TOPIC_LIST__", topics.prompt_list())
 
 USER_PROMPT_TEMPLATE = """\
 Source page: {page_title}
@@ -410,7 +412,9 @@ def render_card(data: dict[str, Any], note: RawNote | None = None, today: date |
 
     question = (data.get("question") or (note.question if note else "")).strip()
     card_id = slugify(str(data.get("id") or "").strip() or question, max_length=48)
-    topic = (data.get("topic") or (note.suggested_topic if note else "Uncategorised")).strip()
+    # Snapped, not trusted: the prompt asks for a value from the vocabulary,
+    # but a model that ignores it would otherwise open a new folder per card.
+    topic = topics.canonical(data.get("topic") or (note.suggested_topic if note else ""))
 
     matrix_lines = []
     for row in data.get("decision_matrix") or []:
