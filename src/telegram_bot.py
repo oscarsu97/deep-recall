@@ -67,6 +67,7 @@ STAGE_REVEAL = "rev"
 STAGE_SHIFT = "shf"
 STAGE_FULL = "full"
 STAGE_RATE = "rate"
+STAGE_PRACTICE = "prac"
 
 QUALITY_LABELS = {QUALITY_HARD: "🔴 Hard", QUALITY_GOOD: "🟡 Good", QUALITY_EASY: "🟢 Easy"}
 
@@ -289,6 +290,7 @@ class DeepRecallBot:
             "🧠 <b>DeepRecall</b> is listening.\n\n"
             "/review — push the cards due today\n"
             "/review &lt;topic&gt; — drill one topic, due or not\n"
+            "/practice — choose a topic to drill from a menu\n"
             "/topics — what is in the vault\n"
             "/stats — vault overview\n"
             "/due — how many are waiting\n\n"
@@ -367,6 +369,27 @@ class DeepRecallBot:
                 parse_mode=ParseMode.HTML,
             )
 
+    async def cmd_practice(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        rows = self.vault.topic_counts()
+        if not rows:
+            await update.effective_message.reply_text("The vault is empty.")
+            return
+
+        keyboard = []
+        row = []
+        for topic, _total, _due in rows:
+            row.append(InlineKeyboardButton(topic, callback_data=Callback(STAGE_PRACTICE, topic).encode()))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+
+        await update.effective_message.reply_text(
+            "Choose a topic to practice:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
     # -- callback handler -------------------------------------------------
 
     async def on_callback(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -377,6 +400,24 @@ class DeepRecallBot:
         callback = Callback.decode(query.data)
         if callback is None:
             await query.answer("Unrecognised button.", show_alert=True)
+            return
+
+        if callback.stage == STAGE_PRACTICE:
+            topic = callback.card_id
+            await query.answer(f"Loading {topic}...")
+            chat_id = update.effective_chat.id
+            sent = await self.push_due(chat_id, topic=topic)
+            if sent:
+                await update.effective_message.reply_text(
+                    f"📖 {sent} card(s) from <b>{html.escape(topic)}</b> — "
+                    "due ones first, then what is coming up.",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await update.effective_message.reply_text(
+                    f"🎉 Nothing due for <b>{html.escape(topic)}</b>.",
+                    parse_mode=ParseMode.HTML,
+                )
             return
 
         card = self._load(callback.card_id)
@@ -505,6 +546,7 @@ class DeepRecallBot:
         app.add_handler(CommandHandler("due", self.cmd_due))
         app.add_handler(CommandHandler("topics", self.cmd_topics))
         app.add_handler(CommandHandler("review", self.cmd_review))
+        app.add_handler(CommandHandler("practice", self.cmd_practice))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_error_handler(self._on_error)
         return app
