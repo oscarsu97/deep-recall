@@ -190,6 +190,8 @@ def render_stage_checkpoints(card: Card, modifier_index: int | None = None) -> t
         "🗝 <b>Cue</b> <i>(the pieces the answer is built from — keep going)</i>",
         md_to_html(card.retrieval_cues()),
     ]
+    if card.plain_gloss:
+        parts += ["", f"💬 <i>{md_to_html(card.plain_gloss)}</i>"]
 
     modifiers = card.constraint_modifiers
     next_index = 0
@@ -216,6 +218,8 @@ def render_stage_checkpoints(card: Card, modifier_index: int | None = None) -> t
 
 def render_stage_full(card: Card) -> tuple[str, InlineKeyboardMarkup]:
     body = [_header(card), ""]
+    if card.plain_gloss:
+        body += [f"💬 <i>{md_to_html(card.plain_gloss)}</i>", ""]
     for title, content in (
         ("⚙️ Direct Mechanism", card.direct_mechanism),
         ("🧭 Decision Matrix", card.sections.get(SECTION_MATRIX, "")),
@@ -282,6 +286,16 @@ class DeepRecallBot:
         except Exception as exc:  # noqa: BLE001 - a git failure must not lose the rating
             log.error("Could not commit review for %s: %s", card.id, exc)
 
+    def _commit_muted_topics(self, message: str) -> None:
+        if not self.config.git_auto_commit:
+            return
+        try:
+            git_sync.commit_paths(
+                [self.vault.muted_topics_path], message, repo=self.config.vault_dir
+            )
+        except Exception as exc:  # noqa: BLE001 - a git failure must not lose the state
+            log.error("Could not commit muted-topics change: %s", exc)
+
     # -- command handlers -------------------------------------------------
 
     async def cmd_start(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -292,6 +306,8 @@ class DeepRecallBot:
             "/review &lt;topic&gt; — drill one topic, due or not\n"
             "/practice — choose a topic to drill from a menu\n"
             "/topics — what is in the vault\n"
+            "/mute &lt;topic&gt; — stop that topic showing up in /review or the daily push\n"
+            "/unmute &lt;topic&gt; — bring it back\n"
             "/stats — vault overview\n"
             "/due — how many are waiting\n\n"
             f"This chat's id is <code>{chat_id}</code> — put it in <code>TELEGRAM_CHAT_ID</code>.",
@@ -310,7 +326,7 @@ class DeepRecallBot:
         )
 
     async def cmd_due(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-        due = self.vault.due_cards()
+        due = self.vault.due_cards(exclude_topics=frozenset(self.vault.load_muted_topics()))
         if not due:
             await update.effective_message.reply_text("🎉 Nothing due. Go write some notes.")
             return
@@ -325,17 +341,74 @@ class DeepRecallBot:
         if not rows:
             await update.effective_message.reply_text("The vault is empty.")
             return
+        muted = self.vault.load_muted_topics()
         listing = "\n".join(
-            f"• <b>{html.escape(topic)}</b> — {total} card(s)"
+            f"• {'🔇 ' if topic in muted else ''}<b>{html.escape(topic)}</b> — {total} card(s)"
             + (f", {due} due" if due else "")
             for topic, total, due in rows
+        )
+        hint = (
+            "\n\n🔇 = muted, skipped by /review and the daily push — "
+            "<code>/unmute &lt;topic&gt;</code> to bring it back."
+            if muted else ""
         )
         await update.effective_message.reply_text(
             f"📚 <b>Topics</b>\n\n{listing}\n\n"
             "Send <code>/review &lt;topic&gt;</code> to drill one — "
-            "<code>/review kafka</code> and <code>/review spring</code> both work.",
+            "<code>/review kafka</code> and <code>/review spring</code> both work."
+            f"{hint}",
             parse_mode=ParseMode.HTML,
         )
+
+    async def _cmd_set_mute(self, update: Update, context: ContextTypes.DEFAULT_TYPE, muting: bool) -> None:
+        verb = "mute" if muting else "unmute"
+        request = " ".join(context.args or []).strip()
+        if not request:
+            await update.effective_message.reply_text(
+                f"Usage: <code>/{verb} &lt;topic&gt;</code>", parse_mode=ParseMode.HTML
+            )
+            return
+
+        available = {t for t, _total, _due in self.vault.topic_counts()}
+        topic = resolve_topic_request(request, available)
+        if topic is None:
+            await update.effective_message.reply_text(
+                f"No cards for <b>{html.escape(request)}</b> — nothing to {verb}. "
+                "Send /topics to see what is in the vault.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        muted = self.vault.load_muted_topics()
+        changed = topic not in muted if muting else topic in muted
+        if muting:
+            muted.add(topic)
+        else:
+            muted.discard(topic)
+
+        try:
+            self.vault.save_muted_topics(muted)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Could not save muted topics: %s", exc)
+            await update.effective_message.reply_text("Could not save that — check the bot logs.")
+            return
+
+        if changed:
+            await asyncio.to_thread(
+                self._commit_muted_topics, f"{verb}({topic}): topic {verb}d"
+            )
+
+        if muting:
+            text = f"🔇 <b>{html.escape(topic)}</b> muted — skipped by /review and the daily push."
+        else:
+            text = f"🔊 <b>{html.escape(topic)}</b> unmuted."
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+    async def cmd_mute(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._cmd_set_mute(update, context, muting=True)
+
+    async def cmd_unmute(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._cmd_set_mute(update, context, muting=False)
 
     async def cmd_review(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id = update.effective_chat.id
@@ -491,7 +564,9 @@ class DeepRecallBot:
             self.vault.topic_cards(topic, limit=limit)
             if topic
             else self.vault.due_cards(
-                limit=limit, new_limit=self.config.max_new_cards_per_session
+                limit=limit,
+                new_limit=self.config.max_new_cards_per_session,
+                exclude_topics=frozenset(self.vault.load_muted_topics()),
             )
         )
         if not due:
@@ -545,6 +620,8 @@ class DeepRecallBot:
         app.add_handler(CommandHandler("stats", self.cmd_stats))
         app.add_handler(CommandHandler("due", self.cmd_due))
         app.add_handler(CommandHandler("topics", self.cmd_topics))
+        app.add_handler(CommandHandler("mute", self.cmd_mute))
+        app.add_handler(CommandHandler("unmute", self.cmd_unmute))
         app.add_handler(CommandHandler("review", self.cmd_review))
         app.add_handler(CommandHandler("practice", self.cmd_practice))
         app.add_handler(CallbackQueryHandler(self.on_callback))

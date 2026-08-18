@@ -186,7 +186,12 @@ this holds, and why — the second-order consequence, not a restatement."
   ],
   "anchor": "MAX 15 WORDS. One real system, product or incident where this \
 shows up, so the idea has somewhere to live in memory. e.g. 'Kafka stores \
-consumer offsets this way in `__consumer_offsets`.' Omit rather than invent."
+consumer offsets this way in `__consumer_offsets`.' Omit rather than invent.",
+  "plain_gloss": "MAX 18 WORDS. Restate what this card is testing in plain \
+English, no jargon, as if explaining to a colleague from a different team. \
+It sits next to the cue tokens during review, so a stalled retrieval doesn't \
+require looking anything up. e.g. 'How Kafka avoids copying message bytes \
+twice when it sends them to a consumer.'"
 }
 
 Provide 2-3 decision_matrix entries and exactly 2 constraint_modifiers. Each \
@@ -257,6 +262,7 @@ MAX_WORDS = {
     "effect": 30,
     "tipping_point": 40,
     "anchor": 15,
+    "plain_gloss": 18,
 }
 
 #: Nouns that mark the academic register we do not want. "Row replacement is
@@ -364,6 +370,15 @@ def lint_card(data: dict[str, Any]) -> list[str]:
         _check_budget(problems, f"constraint_modifiers[{i}].effect", "effect", mod["effect"])
 
     _check_budget(problems, "anchor", "anchor", (data.get("anchor") or "").strip())
+
+    plain_gloss = (data.get("plain_gloss") or "").strip()
+    if not plain_gloss:
+        problems.append(
+            "`plain_gloss` is missing — a jargon-free one-liner is what lets a stalled "
+            "retrieval continue without looking anything up."
+        )
+    else:
+        _check_budget(problems, "plain_gloss", "plain_gloss", plain_gloss)
 
     for sentence in _sentences(_all_prose(data)):
         hit = _BANNED.search(sentence)
@@ -583,6 +598,10 @@ def render_card(data: dict[str, Any], note: RawNote | None = None, today: date |
     subject = (data.get("subject") or "").strip()
     if subject:
         meta["subject"] = subject
+
+    plain_gloss = (data.get("plain_gloss") or "").strip()
+    if plain_gloss:
+        meta["plain_gloss"] = plain_gloss
 
     if note:
         # Lets `--sync` recognise this note next run even though the LLM

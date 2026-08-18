@@ -70,13 +70,13 @@ class Config:
 
     # Local
     vault_dir: Path = REPO_ROOT / "vault"
-    #: Ceiling on one session. Mature reviews cost ~20 seconds each, so this can
-    #: be generous — the load problem is first passes, not repeats.
-    max_cards_per_session: int = 20
+    #: Ceiling on one session. Kept modest — a big push reads as a chore and
+    #: gets ignored; MAX_CARDS_PER_SESSION raises it back up if this is small.
+    max_cards_per_session: int = 10
     #: ...of which at most this many may be cards you have never seen. A Notion
-    #: dump otherwise lands 40 first-pass cards in one day, every one of them
-    #: expensive, and the session gets abandoned rather than rescheduled.
-    max_new_cards_per_session: int = 5
+    #: dump otherwise lands a pile of first-pass cards in one day, every one of
+    #: them expensive, and the session gets abandoned rather than rescheduled.
+    max_new_cards_per_session: int = 3
     git_auto_commit: bool = True
 
     @classmethod
@@ -102,8 +102,8 @@ class Config:
             telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=_env("TELEGRAM_CHAT_ID"),
             vault_dir=vault_dir,
-            max_cards_per_session=_env_int("MAX_CARDS_PER_SESSION", 20),
-            max_new_cards_per_session=_env_int("MAX_NEW_CARDS_PER_SESSION", 5),
+            max_cards_per_session=_env_int("MAX_CARDS_PER_SESSION", 10),
+            max_new_cards_per_session=_env_int("MAX_NEW_CARDS_PER_SESSION", 3),
             git_auto_commit=_env_bool("GIT_AUTO_COMMIT", True),
         )
 

@@ -13,6 +13,7 @@ in Obsidian are never silently destroyed by the bot writing back a rating.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -79,6 +80,7 @@ FRONTMATTER_ORDER = (
     "modifier",
     "topic",
     "subject",
+    "plain_gloss",
     "created",
     "next_review",
     "interval",
@@ -261,6 +263,16 @@ class Card:
     @property
     def anchor(self) -> str:
         return self.sections.get(SECTION_ANCHOR, "").strip()
+
+    @property
+    def plain_gloss(self) -> str:
+        """One jargon-free line restating what the card tests.
+
+        Sits next to the cue tokens (`sendfile(2)`, `O(n log n)`, ...) so a
+        stalled retrieval doesn't require leaving the app to look one up.
+        Empty for cards synthesized before this field existed.
+        """
+        return str(self.meta.get("plain_gloss") or "").strip()
 
     @property
     def direct_mechanism(self) -> str:
@@ -771,8 +783,13 @@ class Vault:
         limit: int | None = None,
         new_limit: int | None = None,
         bury_siblings: bool = True,
+        exclude_topics: frozenset[str] = frozenset(),
     ) -> list[Card]:
         """Cards with `next_review <= today`, most overdue first.
+
+        `exclude_topics` drops muted topics from the default queue. It only
+        applies here, not in `topic_cards()` — asking for a topic by name is a
+        direct request and should work even while it is muted.
 
         `bury_siblings` holds the queue to one card per cluster per day. Two
         cards cut from the same note prime each other: having just recalled the
@@ -790,6 +807,8 @@ class Vault:
         queue.
         """
         due = [card for card in self.load_all() if card.is_due(today)]
+        if exclude_topics:
+            due = [card for card in due if card.topic not in exclude_topics]
         due.sort(key=lambda c: (c.review_state.next_review or date.min, c.id))
 
         if bury_siblings:
@@ -870,6 +889,38 @@ class Vault:
             return None
         except OSError as exc:
             raise VaultError(f"Could not delete {path}: {exc}") from exc
+        return path
+
+    # -- Muted topics -------------------------------------------------------
+    # A topic you have no appetite for today shouldn't keep landing in the
+    # default queue. State lives in the vault (git-tracked, same as cards) so
+    # it survives a bot restart or a fresh GitHub Actions run.
+
+    @property
+    def muted_topics_path(self) -> Path:
+        return self.root / ".muted-topics.json"
+
+    def load_muted_topics(self) -> set[str]:
+        path = self.muted_topics_path
+        if not path.exists():
+            return set()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning("Could not read %s: %s; treating as no muted topics", path, exc)
+            return set()
+        return {str(t) for t in data} if isinstance(data, list) else set()
+
+    def save_muted_topics(self, muted: set[str]) -> Path:
+        path = self.muted_topics_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps(sorted(muted), indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            tmp.unlink(missing_ok=True)
+            raise VaultError(f"Could not write muted topics to {path}: {exc}") from exc
         return path
 
     def stats(self, today: date | None = None) -> dict[str, int]:
